@@ -18,11 +18,9 @@ package prometheusremotewrite
 
 import (
 	"context"
-	"math"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -31,9 +29,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 
-	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/prometheus/prometheus/util/testutil"
 )
 
 func TestCreateAttributes(t *testing.T) {
@@ -55,15 +51,44 @@ func TestCreateAttributes(t *testing.T) {
 	}
 	attrs := pcommon.NewMap()
 	attrs.PutStr("metric-attr", "metric value")
+	attrs.PutStr("metric-attr-other", "metric value other")
 
 	testCases := []struct {
 		name                      string
 		promoteResourceAttributes []string
+		ignoreAttrs               []string
 		expectedLabels            []prompb.Label
 	}{
 		{
 			name:                      "Successful conversion without resource attribute promotion",
 			promoteResourceAttributes: nil,
+			expectedLabels: []prompb.Label{
+				{
+					Name:  "__name__",
+					Value: "test_metric",
+				},
+				{
+					Name:  "instance",
+					Value: "service ID",
+				},
+				{
+					Name:  "job",
+					Value: "service name",
+				},
+				{
+					Name:  "metric_attr",
+					Value: "metric value",
+				},
+				{
+					Name:  "metric_attr_other",
+					Value: "metric value other",
+				},
+			},
+		},
+		{
+			name:                      "Successful conversion with some attributes ignored",
+			promoteResourceAttributes: nil,
+			ignoreAttrs:               []string{"metric-attr-other"},
 			expectedLabels: []prompb.Label{
 				{
 					Name:  "__name__",
@@ -104,6 +129,10 @@ func TestCreateAttributes(t *testing.T) {
 					Value: "metric value",
 				},
 				{
+					Name:  "metric_attr_other",
+					Value: "metric value other",
+				},
+				{
 					Name:  "existent_attr",
 					Value: "resource value",
 				},
@@ -133,6 +162,10 @@ func TestCreateAttributes(t *testing.T) {
 					Name:  "metric_attr",
 					Value: "metric value",
 				},
+				{
+					Name:  "metric_attr_other",
+					Value: "metric value other",
+				},
 			},
 		},
 		{
@@ -159,6 +192,10 @@ func TestCreateAttributes(t *testing.T) {
 					Name:  "metric_attr",
 					Value: "metric value",
 				},
+				{
+					Name:  "metric_attr_other",
+					Value: "metric value other",
+				},
 			},
 		},
 	}
@@ -167,7 +204,7 @@ func TestCreateAttributes(t *testing.T) {
 			settings := Settings{
 				PromoteResourceAttributes: tc.promoteResourceAttributes,
 			}
-			lbls := createAttributes(resource, attrs, settings, nil, false, model.MetricNameLabel, "test_metric")
+			lbls := createAttributes(resource, attrs, settings, tc.ignoreAttrs, false, model.MetricNameLabel, "test_metric")
 
 			assert.ElementsMatch(t, lbls, tc.expectedLabels)
 		})
@@ -276,14 +313,14 @@ func TestPrometheusConverter_AddSummaryDataPoints(t *testing.T) {
 					timeSeriesSignature(labels): {
 						Labels: labels,
 						Samples: []prompb.Sample{
-							{Value: math.Float64frombits(value.QuietZeroNaN), Timestamp: convertTimeStamp(nowMinus2m30s)},
+							{Value: 0, Timestamp: convertTimeStamp(nowMinus2m30s)},
 							{Value: 0, Timestamp: convertTimeStamp(nowUnixNano)},
 						},
 					},
 					timeSeriesSignature(sumLabels): {
 						Labels: sumLabels,
 						Samples: []prompb.Sample{
-							{Value: math.Float64frombits(value.QuietZeroNaN), Timestamp: convertTimeStamp(nowMinus2m30s)},
+							{Value: 0, Timestamp: convertTimeStamp(nowMinus2m30s)},
 							{Value: 0, Timestamp: convertTimeStamp(nowUnixNano)},
 						},
 					},
@@ -324,14 +361,14 @@ func TestPrometheusConverter_AddSummaryDataPoints(t *testing.T) {
 					timeSeriesSignature(labels): {
 						Labels: labels,
 						Samples: []prompb.Sample{
-							{Value: math.Float64frombits(value.QuietZeroNaN), Timestamp: convertTimeStamp(nowMinus6m)},
+							{Value: 0, Timestamp: convertTimeStamp(nowMinus6m)},
 							{Value: 0, Timestamp: convertTimeStamp(nowUnixNano)},
 						},
 					},
 					timeSeriesSignature(sumLabels): {
 						Labels: sumLabels,
 						Samples: []prompb.Sample{
-							{Value: math.Float64frombits(value.QuietZeroNaN), Timestamp: convertTimeStamp(nowMinus6m)},
+							{Value: 0, Timestamp: convertTimeStamp(nowMinus6m)},
 							{Value: 0, Timestamp: convertTimeStamp(nowUnixNano)},
 						},
 					},
@@ -444,15 +481,10 @@ func TestPrometheusConverter_AddSummaryDataPoints(t *testing.T) {
 			)
 			require.NoError(t, err)
 
-			testutil.RequireEqualWithOptions(t, tt.want(), converter.unique, []cmp.Option{cmp.Comparer(equalSamples)})
+			assert.Equal(t, tt.want(), converter.unique)
 			assert.Empty(t, converter.conflicts)
 		})
 	}
-}
-
-func equalSamples(a, b prompb.Sample) bool {
-	// Compare Float64bits so NaN values which are exactly the same will compare equal.
-	return a.Timestamp == b.Timestamp && math.Float64bits(a.Value) == math.Float64bits(b.Value)
 }
 
 func TestPrometheusConverter_AddHistogramDataPoints(t *testing.T) {

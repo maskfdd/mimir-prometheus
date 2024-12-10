@@ -105,15 +105,6 @@ func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
 	return db
 }
 
-// queryHead is a helper to query the head for a given time range and labelset.
-func queryHead(t testing.TB, head *Head, mint, maxt int64, label labels.Label) (map[string][]chunks.Sample, error) {
-	q, err := NewBlockQuerier(head, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-	return query(t, q, labels.MustNewMatcher(labels.MatchEqual, label.Name, label.Value)), nil
-}
-
 // query runs a matcher query against the querier and fully expands its data.
 func query(t testing.TB, q storage.Querier, matchers ...*labels.Matcher) map[string][]chunks.Sample {
 	ss := q.Select(context.Background(), false, nil, matchers...)
@@ -1333,7 +1324,7 @@ func TestTombstoneCleanFail(t *testing.T) {
 	totalBlocks := 2
 	for i := 0; i < totalBlocks; i++ {
 		blockDir := createBlock(t, db.Dir(), genSeries(1, 1, int64(i), int64(i)+1))
-		block, err := OpenBlock(nil, blockDir, nil)
+		block, err := OpenBlock(nil, blockDir, nil, nil)
 		require.NoError(t, err)
 		// Add some fake tombstones to trigger the compaction.
 		tomb := tombstones.NewMemTombstones()
@@ -1388,7 +1379,7 @@ func TestTombstoneCleanRetentionLimitsRace(t *testing.T) {
 			// Generate some blocks with old mint (near epoch).
 			for j := 0; j < totalBlocks; j++ {
 				blockDir := createBlock(t, dbDir, genSeries(10, 1, int64(j), int64(j)+1))
-				block, err := OpenBlock(nil, blockDir, nil)
+				block, err := OpenBlock(nil, blockDir, nil, nil)
 				require.NoError(t, err)
 				// Cover block with tombstones so it can be deleted with CleanTombstones() as well.
 				tomb := tombstones.NewMemTombstones()
@@ -1449,7 +1440,7 @@ func (c *mockCompactorFailing) Write(dest string, _ BlockReader, _, _ int64, _ *
 		return []ulid.ULID{}, errors.New("the compactor already did the maximum allowed blocks so it is time to fail")
 	}
 
-	block, err := OpenBlock(nil, createBlock(c.t, dest, genSeries(1, 1, 0, 1)), nil)
+	block, err := OpenBlock(nil, createBlock(c.t, dest, genSeries(1, 1, 0, 1)), nil, nil)
 	require.NoError(c.t, err)
 	require.NoError(c.t, block.Close()) // Close block as we won't be using anywhere.
 	c.blocks = append(c.blocks, block)
@@ -2522,13 +2513,13 @@ func TestDBReadOnly(t *testing.T) {
 	})
 	t.Run("block", func(t *testing.T) {
 		blockID := expBlock.meta.ULID.String()
-		block, err := dbReadOnly.Block(blockID)
+		block, err := dbReadOnly.Block(blockID, nil)
 		require.NoError(t, err)
 		require.Equal(t, expBlock.Meta(), block.Meta(), "block meta mismatch")
 	})
 	t.Run("invalid block ID", func(t *testing.T) {
 		blockID := "01GTDVZZF52NSWB5SXQF0P2PGF"
-		_, err := dbReadOnly.Block(blockID)
+		_, err := dbReadOnly.Block(blockID, nil)
 		require.Error(t, err)
 	})
 	t.Run("last block ID", func(t *testing.T) {
@@ -9257,7 +9248,7 @@ func TestBlockQuerierAndBlockChunkQuerier(t *testing.T) {
 		// Include blockID into series to identify which block got touched.
 		serieses := []storage.Series{storage.NewListSeries(labels.FromMap(map[string]string{"block": fmt.Sprintf("block-%d", i), labels.MetricName: "test_metric"}), []chunks.Sample{sample{t: 0, f: 1}})}
 		blockDir := createBlock(t, db.Dir(), serieses)
-		b, err := OpenBlock(db.logger, blockDir, db.chunkPool)
+		b, err := OpenBlock(db.logger, blockDir, db.chunkPool, nil)
 		require.NoError(t, err)
 
 		// Overwrite meta.json with compaction section for testing purpose.
