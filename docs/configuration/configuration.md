@@ -135,7 +135,7 @@ global:
   [ keep_dropped_targets: <int> | default = 0 ]
 
   # Specifies the validation scheme for metric and label names. Either blank or
-  # "utf8" for for full UTF-8 support, or "legacy" for letters, numbers, colons,
+  # "utf8" for full UTF-8 support, or "legacy" for letters, numbers, colons,
   # and underscores.
   [ metric_name_validation_scheme <string> | default "utf8" ]
 
@@ -171,8 +171,21 @@ remote_write:
   [ - <remote_write> ... ]
 
 # Settings related to the OTLP receiver feature.
+# See https://prometheus.io/docs/guides/opentelemetry/ for best practices.
 otlp:
   [ promote_resource_attributes: [<string>, ...] | default = [ ] ]
+  # Configures translation of OTLP metrics when received through the OTLP metrics
+  # endpoint. Available values:
+  # - "UnderscoreEscapingWithSuffixes" refers to commonly agreed normalization used
+  #   by OpenTelemetry in https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/pkg/translator/prometheus
+  # - "NoUTF8EscapingWithSuffixes" is a mode that relies on UTF-8 support in Prometheus.
+  #   It preserves all special characters like dots, but still adds required metric name suffixes
+  #   for units and _total, as UnderscoreEscapingWithSuffixes does.
+  [ translation_strategy: <string> | default = "UnderscoreEscapingWithSuffixes" ]
+  # Enables adding "service.name", "service.namespace" and "service.instance.id"
+  # resource attributes to the "target_info" metric, on top of converting
+  # them into the "instance" and "job" labels.
+  [ keep_identifying_resource_attributes: <boolean> | default = false]
 
 # Settings related to the remote read feature.
 remote_read:
@@ -662,6 +675,13 @@ http_headers:
 ### `<azure_sd_config>`
 
 Azure SD configurations allow retrieving scrape targets from Azure VMs.
+
+The discovery requires at least the following permissions:
+
+* `Microsoft.Compute/virtualMachines/read`: Required for VM discovery
+* `Microsoft.Network/networkInterfaces/read`: Required for VM discovery
+* `Microsoft.Compute/virtualMachineScaleSets/virtualMachines/read`: Required for scale set (VMSS) discovery
+* `Microsoft.Compute/virtualMachineScaleSets/virtualMachines/networkInterfaces/read`: Required for scale set (VMSS) discovery
 
 The following meta labels are available on targets during [relabeling](#relabel_config):
 
@@ -2117,7 +2137,8 @@ The following meta labels are available on targets during [relabeling](#relabel_
 [ namespace: <string> | default = default ]
 [ refresh_interval: <duration> | default = 60s ]
 [ region: <string> | default = global ]
-[ server: <host> ]
+# The URL to connect to the API.
+[ server: <string> ]
 [ tag_separator: <string> | default = ,]
 
 # HTTP client settings, including authentication methods (such as basic auth and
@@ -2796,6 +2817,12 @@ write_relabel_configs:
 # Enables sending of native histograms, also known as sparse histograms, over remote write.
 # For the `io.prometheus.write.v2.Request` message, this option is noop (always true).
 [ send_native_histograms: <boolean> | default = false ]
+
+# When enabled, remote-write will resolve the URL host name via DNS, choose one of the IP addresses at random, and connect to it. 
+# When disabled, remote-write relies on Go's standard behavior, which is to try to connect to each address in turn.
+# The connection timeout applies to the whole operation, i.e. in the latter case it is spread over all attempt.
+# This is an experimental feature, and its behavior might still change, or even get removed.
+[ round_robin_dns: <boolean> | default = false ]
 
 # Optionally configures AWS's Signature Verification 4 signing process to
 # sign requests. Cannot be set at the same time as basic_auth, authorization, oauth2, or azuread.
