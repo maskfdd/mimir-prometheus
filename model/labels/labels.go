@@ -474,20 +474,14 @@ func (b *Builder) Labels() Labels {
 		return b.base
 	}
 
-	// In the general case, labels are removed, modified or moved
-	// rather than added.
-	res := make(Labels, 0, len(b.base))
-Outer:
+	expectedSize := len(b.base) + len(b.add) - len(b.del)
+	if expectedSize < 1 {
+		expectedSize = 1
+	}
+	res := make(Labels, 0, expectedSize)
 	for _, l := range b.base {
-		for _, n := range b.del {
-			if l.Name == n {
-				continue Outer
-			}
-		}
-		for _, la := range b.add {
-			if l.Name == la.Name {
-				continue Outer
-			}
+		if containsStr(b.del, l.Name) || contains(b.add, l.Name) {
+			continue
 		}
 		res = append(res, l)
 	}
@@ -496,4 +490,22 @@ Outer:
 		sort.Sort(res)
 	}
 	return res
+}
+
+func contains(s []Label, n string) bool {
+	for _, a := range s {
+		if a.Name == n {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStr(s []string, n string) bool {
+	for _, a := range s {
+		if a == n {
+			return true
+		}
+	}
+	return false
 }
