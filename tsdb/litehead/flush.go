@@ -295,6 +295,8 @@ func (db *DB) truncateMmapped(flushMaxt int64) {
 
 	db.metrics.labelCatalogSize.Set(float64(db.labelCat.size()))
 	db.metrics.labelCatalogCount.Set(float64(db.labelCat.count()))
+	db.metrics.labelCatalogSymbolsSize.Set(float64(db.labelCat.symbolsSize()))
+	db.metrics.labelCatalogSymbolsCount.Set(float64(db.labelCat.symbolsCount()))
 }
 
 // sweepDeadSeries 回收那些"不再有任何 chunk、并且最新样本时间 < flushMaxt"

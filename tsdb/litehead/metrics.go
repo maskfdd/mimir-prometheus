@@ -47,6 +47,8 @@ type dbMetrics struct {
 	mmappedChunksForcedFlush prometheus.Counter
 	labelCatalogSize         prometheus.Gauge
 	labelCatalogCount        prometheus.Gauge
+	labelCatalogSymbolsSize  prometheus.Gauge
+	labelCatalogSymbolsCount prometheus.Gauge
 }
 
 func newDBMetrics(r prometheus.Registerer) *dbMetrics {
@@ -132,6 +134,14 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_litehead_label_catalog_entries",
 		Help: "Number of labelsID entries stored in the lite head labels arena.",
 	})
+	m.labelCatalogSymbolsSize = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_litehead_label_catalog_symbols_bytes",
+		Help: "Total bytes of distinct label name/value strings interned by the lite head symbol table.",
+	})
+	m.labelCatalogSymbolsCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_litehead_label_catalog_symbols_total",
+		Help: "Number of distinct label name/value strings interned by the lite head symbol table.",
+	})
 
 	if r != nil {
 		r.MustRegister(
@@ -142,6 +152,7 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 			m.walReplayDuration, m.walTruncateDuration,
 			m.checkpointCreationTotal, m.checkpointCreationFail,
 			m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
+			m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 		)
 	}
 	return m
@@ -159,6 +170,7 @@ func (m *dbMetrics) unregister() {
 		m.walReplayDuration, m.walTruncateDuration,
 		m.checkpointCreationTotal, m.checkpointCreationFail,
 		m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
+		m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 	} {
 		m.r.Unregister(c)
 	}
