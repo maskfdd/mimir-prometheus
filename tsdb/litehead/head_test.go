@@ -1,7 +1,3 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
 
 import (
@@ -18,7 +14,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 )
 
-func newTestDB(t *testing.T, opts *Options) (*DB, string) {
+func newTestHead(t *testing.T, opts *Options) (*Head, string) {
 	t.Helper()
 	dir := t.TempDir()
 	if opts == nil {
@@ -30,18 +26,18 @@ func newTestDB(t *testing.T, opts *Options) (*DB, string) {
 	opts.SamplesPerChunk = 8
 	opts.NoLockfile = true
 
-	db, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h, err := Open(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	return db, dir
+	return h, dir
 }
 
 func TestWriteAndReadBackViaFlush(t *testing.T) {
-	db, dir := newTestDB(t, nil)
-	t.Cleanup(func() { _ = db.Close() })
+	h, dir := newTestHead(t, nil)
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "h1")
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	ref, err := app.Append(0, lset, 1000, 1.0)
 	require.NoError(t, err)
 	require.NotZero(t, ref)
@@ -51,17 +47,17 @@ func TestWriteAndReadBackViaFlush(t *testing.T) {
 	require.NoError(t, app.Commit())
 
 	// 再写一批
-	app = db.Appender(ctx)
+	app = h.Appender(ctx)
 	_, err = app.Append(ref, labels.EmptyLabels(), 3000, 3.0)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	require.Equal(t, int64(1000), db.MinTime())
-	require.Equal(t, int64(3000), db.MaxTime())
-	require.Equal(t, 1, db.NumSeries())
+	require.Equal(t, int64(1000), h.MinTime())
+	require.Equal(t, int64(3000), h.MaxTime())
+	require.Equal(t, 1, h.NumSeries())
 
 	// 强制 flush 窗口 [0, BlockDuration-1]，写出 block。
-	require.NoError(t, db.tryFlushAll())
+	require.NoError(t, h.tryFlushAll())
 
 	// 应该至少出现一个 block 目录（ULID 26 字符）。
 	entries, err := os.ReadDir(dir)
@@ -87,26 +83,26 @@ func TestWriteAndReadBackViaFlush(t *testing.T) {
 }
 
 func TestRefReuseHot(t *testing.T) {
-	db, _ := newTestDB(t, nil)
-	t.Cleanup(func() { _ = db.Close() })
+	h, _ := newTestHead(t, nil)
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "h1")
 
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	ref1, err := app.Append(0, lset, 100, 1)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
 	// 用同样的 ref 再写一次，确保热路径可用。
-	app = db.Appender(ctx)
+	app = h.Appender(ctx)
 	ref2, err := app.Append(ref1, labels.EmptyLabels(), 200, 2)
 	require.NoError(t, err)
 	require.Equal(t, ref1, ref2)
 	require.NoError(t, app.Commit())
 
 	// GetRef 也应能命中。
-	appender := db.Appender(ctx).(*appender)
+	appender := h.Appender(ctx).(*appender)
 	gotRef, gotLset := appender.GetRef(lset, lset.Hash())
 	require.Equal(t, ref1, gotRef)
 	require.True(t, labels.Equal(lset, gotLset))
@@ -114,13 +110,13 @@ func TestRefReuseHot(t *testing.T) {
 }
 
 func TestOutOfOrderSampleRejected(t *testing.T) {
-	db, _ := newTestDB(t, nil)
-	t.Cleanup(func() { _ = db.Close() })
+	h, _ := newTestHead(t, nil)
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu")
 
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	ref, err := app.Append(0, lset, 1000, 1)
 	require.NoError(t, err)
 	_, err = app.Append(ref, labels.EmptyLabels(), 500, 2)
@@ -129,17 +125,17 @@ func TestOutOfOrderSampleRejected(t *testing.T) {
 }
 
 func TestRestartWALReplayRecoversSeries(t *testing.T) {
-	db, dir := newTestDB(t, nil)
+	h, dir := newTestHead(t, nil)
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "h1")
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	ref, err := app.Append(0, lset, 1000, 1.0)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
 	// 模拟关机
-	require.NoError(t, db.Close())
+	require.NoError(t, h.Close())
 
 	// 重新打开
 	opts := DefaultOptions()
@@ -147,12 +143,12 @@ func TestRestartWALReplayRecoversSeries(t *testing.T) {
 	opts.BlockDuration = 60 * 1000
 	opts.SamplesPerChunk = 8
 	opts.NoLockfile = true
-	db2, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h2, err := Open(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db2.Close() })
+	t.Cleanup(func() { _ = h2.Close() })
 
 	// 现在用相同 labels 做 GetRef 应该能拿到原来的 ref（或至少 series 已存在）。
-	appender2 := db2.Appender(ctx).(*appender)
+	appender2 := h2.Appender(ctx).(*appender)
 	gotRef, _ := appender2.GetRef(lset, lset.Hash())
 	require.NotZero(t, gotRef, "series must be recovered from WAL")
 	require.Equal(t, ref, gotRef)
@@ -162,12 +158,12 @@ func TestRestartWALReplayRecoversSeries(t *testing.T) {
 func TestChunkSealingOnCapacity(t *testing.T) {
 	opts := DefaultOptions()
 	opts.SamplesPerChunk = 2 // 让 chunk 切分频繁发生
-	db, _ := newTestDB(t, opts)
-	t.Cleanup(func() { _ = db.Close() })
+	h, _ := newTestHead(t, opts)
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu")
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	var ref storage.SeriesRef
 	var err error
 	// 写 20 条样本，应该至少触发 1 次 chunk 切分。
@@ -179,20 +175,20 @@ func TestChunkSealingOnCapacity(t *testing.T) {
 }
 
 func TestRollbackStillLogsNewSeries(t *testing.T) {
-	db, _ := newTestDB(t, nil)
-	t.Cleanup(func() { _ = db.Close() })
+	h, _ := newTestHead(t, nil)
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu")
 
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	ref, err := app.Append(0, lset, 1000, 1.0)
 	require.NoError(t, err)
 	require.NotZero(t, ref)
 	require.NoError(t, app.Rollback())
 
 	// series 应该依然可用（Rollback 也会写 Series 记录到 WAL）。
-	appender := db.Appender(ctx).(*appender)
+	appender := h.Appender(ctx).(*appender)
 	gotRef, _ := appender.GetRef(lset, lset.Hash())
 	require.Equal(t, ref, gotRef)
 	require.NoError(t, appender.Commit())
@@ -212,7 +208,7 @@ func TestSealedOverflowDoesNotLoseData(t *testing.T) {
 	opts.BlockDuration = 60 * 1000 // 让 block 足够大，把所有样本都落到同一个 block
 	opts.NoLockfile = true
 	dir := t.TempDir()
-	db, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h, err := Open(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -220,7 +216,7 @@ func TestSealedOverflowDoesNotLoseData(t *testing.T) {
 
 	// 写 3 倍 maxMmappedChunksPerSeries 数量的样本，确保至少发生一次 mmapped chunks 超限。
 	const total = int64(maxMmappedChunksPerSeries * 3)
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	var ref storage.SeriesRef
 	for i := int64(0); i < total; i++ {
 		// 每条样本时间戳递增 ChunkRange*2，保证一定切新 chunk 并 spill。
@@ -230,7 +226,7 @@ func TestSealedOverflowDoesNotLoseData(t *testing.T) {
 	require.NoError(t, app.Commit())
 
 	// 触发一次关机路径的全量 flush，把所有样本落成 block。
-	require.NoError(t, db.Close())
+	require.NoError(t, h.Close())
 
 	// 扫描 block 目录，把所有 block 的样本数加起来应等于 total。
 	entries, err := os.ReadDir(dir)
@@ -258,38 +254,38 @@ func TestGCAfterFlushRemovesIdleSeries(t *testing.T) {
 	opts.BlockDuration = 60 * 1000
 	opts.SamplesPerChunk = 8
 	opts.NoLockfile = true
-	db, _ := func() (*DB, string) {
+	h, _ := func() (*Head, string) {
 		dir := t.TempDir()
 		d, err := Open(log.NewNopLogger(), nil, dir, opts)
 		require.NoError(t, err)
 		return d, dir
 	}()
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { _ = h.Close() })
 
 	ctx := context.Background()
 	// 创建两条 series，落在同一个 flush 窗口内。
 	lsetA := labels.FromStrings("__name__", "a")
 	lsetB := labels.FromStrings("__name__", "b")
 
-	app := db.Appender(ctx)
+	app := h.Appender(ctx)
 	refA, err := app.Append(0, lsetA, 1000, 1)
 	require.NoError(t, err)
 	refB, err := app.Append(0, lsetB, 1500, 2)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	require.Equal(t, 2, db.NumSeries())
+	require.Equal(t, 2, h.NumSeries())
 
 	// 全量 flush，应把 [MinT, MaxT] 全部落成 block。
-	require.NoError(t, db.tryFlushAll())
+	require.NoError(t, h.tryFlushAll())
 
 	// flush 后：两条 series 都没有 openChunk、没有 sealed[]、lastTs 已过窗口，
 	// 应该都被 GC 清掉。NumSeries 归零。
-	require.Equal(t, 0, db.NumSeries(),
+	require.Equal(t, 0, h.NumSeries(),
 		"idle series should be garbage-collected after flush")
 
 	// 同样 labels 再次写入，应该会创建新的 series，不再复用旧 ref。
-	app = db.Appender(ctx)
+	app = h.Appender(ctx)
 	newRefA, err := app.Append(0, lsetA, 70_000, 3)
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())

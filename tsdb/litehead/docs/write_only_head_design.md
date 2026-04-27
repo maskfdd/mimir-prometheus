@@ -308,7 +308,7 @@ maxt-mint > (ChunkRange*3)/2
 ### 6.3 `compactHeadWindowOpts` 关键步骤
 
 1. **推进 `minValidTime` 到 `maxt+1`**：防止样本在 flush 期间掉进已 flush 区间（对齐标准 Head）
-2. **构造 `liteHeadBlockReader`**（见 §6.4）：若窗口内无数据，直接走 truncate 路径并结束
+2. **构造 `blockReader`**（见 §6.4）：若窗口内无数据，直接走 truncate 路径并结束
 3. **`NewLeveledCompactor` + `compactor.Write(dir, br, mint, maxt+1, nil)`**——区间是半开的 `[mint, maxt+1)`，与原生 Head flush 约定一致
 4. **失败回滚 `minValidTime`**：保证失败后 Append 仍然可以写原窗口的数据
 5. **成功后 truncate**：
@@ -325,7 +325,7 @@ maxt-mint > (ChunkRange*3)/2
 
 `sweepDeadSeries` 回收的前提是：`openChunk == nil && mmappedChunksCount == 0 && lastTs <= flushMaxt`。labelCatalog 里 `labelsID` 仍然驻留（append-only 限制）。
 
-### 6.4 `liteHeadBlockReader`：BlockReader 快照
+### 6.4 `blockReader`：BlockReader 快照
 
 这是一个**只读、一次性**的视图，生命周期仅在 `compactor.Write` 调用期间。
 
@@ -337,13 +337,13 @@ maxt-mint > (ChunkRange*3)/2
 
 暴露的接口：
 
-- `Index()` → `liteHeadIndexReader`：
+- `Index()` → `indexReader`：
   - `Postings` 只可靠支持 `AllPostings`（compactor 实际会调的形态）
   - `SortedPostings` 基于快照重排
   - `ShardedPostings` 用 `labels.StableHash` 过滤
   - `Series(ref, builder, chks)` 按快照返回 labels 和 `chunks.Meta`（open chunk 的 `MaxTime = MaxInt64`，对齐原生"可增长"语义）
   - 其它 `LabelNames/LabelValues/PostingsForMatchers` 为防御式实现，compactor 不会走到
-- `Chunks()` → `liteHeadChunkReader`：按 `HeadChunkRef` 拆出 series+chunk id，`mmapped` 走 `ChunkDiskMapper.Chunk()`，`open` 用 `chunkenc.FromData` 解码冻结字节
+- `Chunks()` → `chunkReader`：按 `HeadChunkRef` 拆出 series+chunk id，`mmapped` 走 `ChunkDiskMapper.Chunk()`，`open` 用 `chunkenc.FromData` 解码冻结字节
 - `Tombstones()` 固定返回空
 - `Meta()` 只给出 `MinTime/MaxTime`；真正落盘的 block ULID 由 `compactor.Write` 自己生成
 
@@ -379,7 +379,7 @@ return max(minValidTime, cwEnd)
    - `record.Samples` → 按 ref 查 `refTab`，找不到直接跳过（series 可能已被 GC），找到则更新 `lastTs` 与全局 min/max
    - `Tombstones / Exemplars / Metadata / HistogramSamples / FloatHistogramSamples / MmapMarkers / 未知类型` 一律忽略：LiteHead 不使用
 
-**为什么不恢复 open chunk 也不丢数据？** 因为任何已 `Commit` 的样本都在 WAL 里，随后的周期 flush 会从 WAL 读到它们（via `liteHeadBlockReader` 构造时的 refTab 快照），落进 block；`lastTs` 的恢复足以阻挡 replay 之后的乱序样本。
+**为什么不恢复 open chunk 也不丢数据？** 因为任何已 `Commit` 的样本都在 WAL 里，随后的周期 flush 会从 WAL 读到它们（via `blockReader` 构造时的 refTab 快照），落进 block；`lastTs` 的恢复足以阻挡 replay 之后的乱序样本。
 
 失败时 `wlog.Repair` 兜底一次，失败再返回聚合错误。
 
@@ -396,7 +396,7 @@ return max(minValidTime, cwEnd)
 | `series.go` | `memSeries`、`refTable`、`hashIndex`、`mmappedChunk` | ~235 |
 | `label_catalog.go` | `labelCatalog` + `symbolTable` | ~250 |
 | `flush.go` | 周期 flush / 强制 flush / Close flush、truncateMemory、truncateWAL | ~390 |
-| `blockreader.go` | `liteHeadBlockReader / IndexReader / ChunkReader` | ~440 |
+| `blockreader.go` | `blockReader / IndexReader / ChunkReader` | ~440 |
 | `replay.go` | ChunkDiskMapper 回放 + WAL replay | ~190 |
 | `metrics.go` | 对齐标准 Head 的指标 | ~180 |
 
@@ -482,7 +482,7 @@ LiteHead 有意不提供的：
 - in-order float 样本写入
 - `refTab` / `hashIdx` / `labelCat`（含 `symbolTable`）
 - chunk 切分 + sealed spill 到 `ChunkDiskMapper`（forced flush 兜底）
-- 周期 / 强制 / Close 三类 flush，统一走 `liteHeadBlockReader` + `LeveledCompactor.Write`
+- 周期 / 强制 / Close 三类 flush，统一走 `blockReader` + `LeveledCompactor.Write`
 - WAL + replay（不重建 openChunk）
 - 对齐标准 Head 的监控指标 + litehead 特有的少量指标
 
@@ -512,5 +512,5 @@ LiteHead 有意不提供的：
 - **WAL replay**：进程重启后重放 WAL，恢复内存状态。
 - **arena**：一块连续的内存区域。这里用于紧凑存储 labels，减少零散对象和指针开销。
 - **symbolTable**：append-only 字符串池，给每个不同的 label name / value 分配一个 uint32 ID。
-- **`BlockReader`**：`compactor.Write` 所需的读取视图。这里由 `liteHeadBlockReader` 实现，只在 flush 期间临时存在。
+- **`BlockReader`**：`compactor.Write` 所需的读取视图。这里由 `blockReader` 实现，只在 flush 期间临时存在。
 - **OOO**：Out-Of-Order，指时间戳乱序写入。本方案只处理 in-order 写入。

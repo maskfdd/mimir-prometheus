@@ -1,7 +1,3 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
 
 import (
@@ -22,21 +18,21 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 )
 
-// liteHeadBlockReader 让 litehead.DB 直接以 tsdb.BlockReader 身份
+// blockReader 让 litehead.Head 直接以 tsdb.BlockReader 身份
 // 喂给 LeveledCompactor.Write，省掉 "临时 Head + WAL 回放" 那一趟复制。
 //
 // 生命周期：每次 compactHeadWindow 调用时新建，写完 block 就丢。
-// 快照在 newLiteHeadBlockReader 里一次性采集；后续 Postings / Series /
-// Chunk 都从这份快照取，不再回 DB 的主索引（refTab/hashIdx），避免
+// 快照在 newBlockReader 里一次性采集；后续 Postings / Series /
+// Chunk 都从这份快照取，不再回 Head 的主索引（refTab/hashIdx），避免
 // flush 期间的并发追加 / spill 把状态改掉。
 //
-// 并发模型：flush 与 appender 之间靠 db.flushMtx 互斥 compact 本身，
+// 并发模型：flush 与 appender 之间靠 h.flushMtx 互斥 compact 本身，
 // 但 append 仍可能并行写同一条 series 的 open chunk。Chunk(meta) 读
 // open chunk 字节时用 s.mu 保护 + bytes copy，避开和 appender 的竞争。
 // mmappedChunks 一旦 spill 到 ChunkDiskMapper 就不可变，直接 cdm.Chunk
 // 读即可。
-type liteHeadBlockReader struct {
-	db         *DB
+type blockReader struct {
+	head       *Head
 	mint, maxt int64
 
 	meta tsdb.BlockMeta
@@ -77,11 +73,11 @@ const (
 	chunkSourceOpen
 )
 
-// newLiteHeadBlockReader 构造快照。
+// newBlockReader 构造快照。
 // 不能在 refTab.forEach 的回调里再取主锁，参见 refTab.forEach 注释。
-func newLiteHeadBlockReader(db *DB, mint, maxt int64) *liteHeadBlockReader {
-	r := &liteHeadBlockReader{
-		db:       db,
+func newBlockReader(h *Head, mint, maxt int64) *blockReader {
+	r := &blockReader{
+		head:     h,
 		mint:     mint,
 		maxt:     maxt,
 		refToIdx: make(map[storage.SeriesRef]int, 1024),
@@ -89,7 +85,7 @@ func newLiteHeadBlockReader(db *DB, mint, maxt int64) *liteHeadBlockReader {
 
 	symbols := make(map[string]struct{}, 256)
 
-	db.refTab.forEach(func(s *memSeries) {
+	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
 		if !seriesOverlapsWindowLocked(s, mint, maxt) {
 			s.mu.Unlock()
@@ -130,7 +126,7 @@ func newLiteHeadBlockReader(db *DB, mint, maxt int64) *liteHeadBlockReader {
 			s.mu.Unlock()
 			return
 		}
-		lset := db.labelCat.get(s.labelsID)
+		lset := h.labelCat.get(s.labelsID)
 		snap := &seriesSnapshot{
 			ref:    s.ref,
 			lset:   lset,
@@ -190,38 +186,38 @@ func seriesOverlapsWindowLocked(s *memSeries, mint, maxt int64) bool {
 
 // ---------------- BlockReader ----------------
 
-func (r *liteHeadBlockReader) Meta() tsdb.BlockMeta { return r.meta }
+func (r *blockReader) Meta() tsdb.BlockMeta { return r.meta }
 
-func (r *liteHeadBlockReader) Size() int64 { return 0 }
+func (r *blockReader) Size() int64 { return 0 }
 
-func (r *liteHeadBlockReader) Index() (tsdb.IndexReader, error) {
-	return &liteHeadIndexReader{r: r}, nil
+func (r *blockReader) Index() (tsdb.IndexReader, error) {
+	return &indexReader{r: r}, nil
 }
 
-func (r *liteHeadBlockReader) Chunks() (tsdb.ChunkReader, error) {
-	return &liteHeadChunkReader{r: r}, nil
+func (r *blockReader) Chunks() (tsdb.ChunkReader, error) {
+	return &chunkReader{r: r}, nil
 }
 
-func (r *liteHeadBlockReader) Tombstones() (tombstones.Reader, error) {
+func (r *blockReader) Tombstones() (tombstones.Reader, error) {
 	return tombstones.NewMemTombstones(), nil
 }
 
 // ---------------- IndexReader ----------------
 
-type liteHeadIndexReader struct {
-	r *liteHeadBlockReader
+type indexReader struct {
+	r *blockReader
 }
 
-func (ir *liteHeadIndexReader) Close() error { return nil }
+func (ir *indexReader) Close() error { return nil }
 
-func (ir *liteHeadIndexReader) Symbols() index.StringIter {
+func (ir *indexReader) Symbols() index.StringIter {
 	return index.NewStringListIter(ir.r.symbolSet)
 }
 
 // Postings 只支持 AllPostingsKey("" / "")，这是 compactor 唯一会调的形态。
 // 其它 name/value 精确查询在本 reader 场景下不会被触发；即便意外被调到，
 // 返回 EmptyPostings 也只是让 compactor 少写一点，不会 panic。
-func (ir *liteHeadIndexReader) Postings(ctx context.Context, name string, values ...string) (index.Postings, error) {
+func (ir *indexReader) Postings(ctx context.Context, name string, values ...string) (index.Postings, error) {
 	switch len(values) {
 	case 0:
 		return index.EmptyPostings(), nil
@@ -248,7 +244,7 @@ func (ir *liteHeadIndexReader) Postings(ctx context.Context, name string, values
 	}
 }
 
-func (ir *liteHeadIndexReader) SortedPostings(p index.Postings) index.Postings {
+func (ir *indexReader) SortedPostings(p index.Postings) index.Postings {
 	series := make([]*seriesSnapshot, 0, 128)
 	for p.Next() {
 		idx, ok := ir.r.refToIdx[p.At()]
@@ -270,7 +266,7 @@ func (ir *liteHeadIndexReader) SortedPostings(p index.Postings) index.Postings {
 	return index.NewListPostings(refs)
 }
 
-func (ir *liteHeadIndexReader) ShardedPostings(p index.Postings, shardIndex, shardCount uint64) index.Postings {
+func (ir *indexReader) ShardedPostings(p index.Postings, shardIndex, shardCount uint64) index.Postings {
 	var out []storage.SeriesRef
 	for p.Next() {
 		ref := p.At()
@@ -286,7 +282,7 @@ func (ir *liteHeadIndexReader) ShardedPostings(p index.Postings, shardIndex, sha
 	return index.NewListPostings(out)
 }
 
-func (ir *liteHeadIndexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
+func (ir *indexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
 	idx, ok := ir.r.refToIdx[ref]
 	if !ok {
 		return storage.ErrNotFound
@@ -315,7 +311,7 @@ func (ir *liteHeadIndexReader) Series(ref storage.SeriesRef, builder *labels.Scr
 // 下面这些方法 compactor 不会调，但 IndexReader 接口要求齐全。
 // 给出能 work 的朴素实现以防外部代码误调。
 
-func (ir *liteHeadIndexReader) SortedLabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
+func (ir *indexReader) SortedLabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
 	v, err := ir.LabelValues(ctx, name, matchers...)
 	if err != nil {
 		return nil, err
@@ -324,7 +320,7 @@ func (ir *liteHeadIndexReader) SortedLabelValues(ctx context.Context, name strin
 	return v, nil
 }
 
-func (ir *liteHeadIndexReader) LabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
+func (ir *indexReader) LabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, s := range ir.r.series {
 		if v := s.lset.Get(name); v != "" {
@@ -338,7 +334,7 @@ func (ir *liteHeadIndexReader) LabelValues(ctx context.Context, name string, mat
 	return out, nil
 }
 
-func (ir *liteHeadIndexReader) LabelNames(ctx context.Context, matchers ...*labels.Matcher) ([]string, error) {
+func (ir *indexReader) LabelNames(ctx context.Context, matchers ...*labels.Matcher) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, s := range ir.r.series {
 		s.lset.Range(func(l labels.Label) {
@@ -353,7 +349,7 @@ func (ir *liteHeadIndexReader) LabelNames(ctx context.Context, matchers ...*labe
 	return out, nil
 }
 
-func (ir *liteHeadIndexReader) PostingsForMatchers(ctx context.Context, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
+func (ir *indexReader) PostingsForMatchers(ctx context.Context, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
 	var refs []storage.SeriesRef
 	for _, s := range ir.r.series {
 		match := true
@@ -370,7 +366,7 @@ func (ir *liteHeadIndexReader) PostingsForMatchers(ctx context.Context, concurre
 	return index.NewListPostings(refs), nil
 }
 
-func (ir *liteHeadIndexReader) LabelValueFor(_ context.Context, id storage.SeriesRef, label string) (string, error) {
+func (ir *indexReader) LabelValueFor(_ context.Context, id storage.SeriesRef, label string) (string, error) {
 	idx, ok := ir.r.refToIdx[id]
 	if !ok {
 		return "", storage.ErrNotFound
@@ -382,7 +378,7 @@ func (ir *liteHeadIndexReader) LabelValueFor(_ context.Context, id storage.Serie
 	return v, nil
 }
 
-func (ir *liteHeadIndexReader) LabelNamesFor(ctx context.Context, ids ...storage.SeriesRef) ([]string, error) {
+func (ir *indexReader) LabelNamesFor(ctx context.Context, ids ...storage.SeriesRef) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, id := range ids {
 		idx, ok := ir.r.refToIdx[id]
@@ -403,13 +399,13 @@ func (ir *liteHeadIndexReader) LabelNamesFor(ctx context.Context, ids ...storage
 
 // ---------------- ChunkReader ----------------
 
-type liteHeadChunkReader struct {
-	r *liteHeadBlockReader
+type chunkReader struct {
+	r *blockReader
 }
 
-func (cr *liteHeadChunkReader) Close() error { return nil }
+func (cr *chunkReader) Close() error { return nil }
 
-func (cr *liteHeadChunkReader) Chunk(meta chunks.Meta) (chunkenc.Chunk, error) {
+func (cr *chunkReader) Chunk(meta chunks.Meta) (chunkenc.Chunk, error) {
 	sref, cid := chunks.HeadChunkRef(meta.Ref).Unpack()
 	idx, ok := cr.r.refToIdx[storage.SeriesRef(sref)]
 	if !ok {
@@ -423,7 +419,7 @@ func (cr *liteHeadChunkReader) Chunk(meta chunks.Meta) (chunkenc.Chunk, error) {
 
 	switch d.kind {
 	case chunkSourceMmapped:
-		chk, err := cr.r.db.chunkDiskMapper.Chunk(d.mmappedRef)
+		chk, err := cr.r.head.chunkDiskMapper.Chunk(d.mmappedRef)
 		if err != nil {
 			return nil, errors.Wrap(err, "read mmapped chunk")
 		}

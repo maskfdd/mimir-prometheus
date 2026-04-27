@@ -1,7 +1,3 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
 
 import (
@@ -124,7 +120,7 @@ func (o *Options) validate() *Options {
 	return o
 }
 
-// DB 是 LiteHead 的对外入口，实现了 storage.Storage 的子集，可以直接
+// Head 是 LiteHead 的对外入口，实现了 storage.Storage 的子集，可以直接
 // 作为 mimir-ingester 中 tsdb.Head 的替代。
 //
 // 字段命名尽可能向标准 tsdb.Head 对齐：
@@ -132,7 +128,7 @@ func (o *Options) validate() *Options {
 //   - chunkDiskMapper（不是 chunkDisk）
 //
 // 这样读代码时可以直接和 tsdb/head.go 对照。
-type DB struct {
+type Head struct {
 	logger log.Logger
 	dir    string
 	opts   *Options
@@ -165,12 +161,12 @@ type DB struct {
 	stopc    chan struct{}
 	flushMtx sync.Mutex
 
-	metrics *dbMetrics
+	metrics *headMetrics
 }
 
 // Open 打开或创建一个 LiteHead 实例。dir 为顶层目录，会在其下创建
 // wal/ 和 chunks_head/ 子目录。
-func Open(logger log.Logger, reg prometheus.Registerer, dir string, opts *Options) (*DB, error) {
+func Open(logger log.Logger, reg prometheus.Registerer, dir string, opts *Options) (*Head, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -196,7 +192,7 @@ func Open(logger log.Logger, reg prometheus.Registerer, dir string, opts *Option
 		return nil, errors.Wrap(err, "open chunk disk mapper")
 	}
 
-	db := &DB{
+	h := &Head{
 		logger:          logger,
 		dir:             dir,
 		opts:            opts,
@@ -212,17 +208,17 @@ func Open(logger log.Logger, reg prometheus.Registerer, dir string, opts *Option
 		donec: make(chan struct{}),
 		stopc: make(chan struct{}),
 
-		metrics: newDBMetrics(reg),
+		metrics: newHeadMetrics(reg),
 	}
-	db.minTime.Store(math.MaxInt64)
-	db.maxTime.Store(math.MinInt64)
-	db.minValidTime.Store(math.MinInt64)
+	h.minTime.Store(math.MaxInt64)
+	h.maxTime.Store(math.MinInt64)
+	h.minValidTime.Store(math.MinInt64)
 
-	db.seriesPool.New = func() interface{} { return &memSeries{} }
-	db.bufPool.New = func() interface{} { b := make([]byte, 0, 1024); return &b }
-	db.appenderPool.New = func() interface{} {
+	h.seriesPool.New = func() interface{} { return &memSeries{} }
+	h.bufPool.New = func() interface{} { b := make([]byte, 0, 1024); return &b }
+	h.appenderPool.New = func() interface{} {
 		return &appender{
-			db:             db,
+			head:           h,
 			pendingSeries:  make([]record.RefSeries, 0, 256),
 			pendingSamples: make([]record.RefSample, 0, 1024),
 			sampleSeries:   make([]*memSeries, 0, 1024),
@@ -231,74 +227,74 @@ func Open(logger log.Logger, reg prometheus.Registerer, dir string, opts *Option
 
 	// 先回放 ChunkDiskMapper（触发 mmap 文件打开、读取最大 ref），再回放 WAL。
 	// 这样 WAL replay 就能基于已知的 chunkRef 决定是否跳过“孤儿 sealed”。
-	if err := db.replayChunkDiskMapper(); err != nil {
+	if err := h.replayChunkDiskMapper(); err != nil {
 		level.Warn(logger).Log("msg", "chunk disk mapper replay returned error", "err", err)
 	}
-	if err := db.replayWAL(); err != nil {
+	if err := h.replayWAL(); err != nil {
 		level.Warn(logger).Log("msg", "WAL replay error, attempting repair", "err", err)
 		if repairErr := w.Repair(err); repairErr != nil {
 			return nil, tsdb_errors.NewMulti(errors.Wrap(err, "replay WAL"), errors.Wrap(repairErr, "repair WAL")).Err()
 		}
 	}
 
-	go db.run()
-	return db, nil
+	go h.run()
+	return h, nil
 }
 
 // Close 触发一次 Flush/Checkpoint，并释放底层资源。
-func (db *DB) Close() error {
-	close(db.stopc)
-	<-db.donec
+func (h *Head) Close() error {
+	close(h.stopc)
+	<-h.donec
 
 	errs := tsdb_errors.NewMulti()
 
 	// 尝试最后一次 flush，把内存里的数据固化成 block。失败不阻塞关机。
-	if err := db.tryFlushAll(); err != nil {
-		level.Warn(db.logger).Log("msg", "final flush failed", "err", err)
+	if err := h.tryFlushAll(); err != nil {
+		level.Warn(h.logger).Log("msg", "final flush failed", "err", err)
 	}
 
 	// 触发一次 WAL checkpoint，减少下次启动的 replay 时间。
 	// TODO：当 EnableMemorySnapshotOnShutdown 为 true 时，这里应该写出
 	// 完整的内存快照（类似 tsdb.Head.ChunkSnapshot），启动时读取后可以
 	// 跳过大部分 WAL 重放。本期先用 checkpoint 兑底，保证数据不丢。
-	if db.opts.EnableMemorySnapshotOnShutdown {
-		if err := db.truncateWAL(math.MaxInt64); err != nil {
-			level.Warn(db.logger).Log("msg", "shutdown checkpoint failed", "err", err)
+	if h.opts.EnableMemorySnapshotOnShutdown {
+		if err := h.truncateWAL(math.MaxInt64); err != nil {
+			level.Warn(h.logger).Log("msg", "shutdown checkpoint failed", "err", err)
 		}
 	}
 
-	if err := db.chunkDiskMapper.Close(); err != nil {
+	if err := h.chunkDiskMapper.Close(); err != nil {
 		errs.Add(errors.Wrap(err, "close chunk disk mapper"))
 	}
-	if err := db.wal.Close(); err != nil {
+	if err := h.wal.Close(); err != nil {
 		errs.Add(errors.Wrap(err, "close WAL"))
 	}
-	if err := db.locker.Release(); err != nil {
+	if err := h.locker.Release(); err != nil {
 		errs.Add(errors.Wrap(err, "release lock"))
 	}
 
-	db.metrics.unregister()
+	h.metrics.unregister()
 
 	return errs.Err()
 }
 
 // Dir 返回数据目录。
-func (db *DB) Dir() string { return db.dir }
+func (h *Head) Dir() string { return h.dir }
 
 // NumSeries 返回当前活跃 series 的近似数量。
-func (db *DB) NumSeries() int { return db.refTab.len() }
+func (h *Head) NumSeries() int { return h.refTab.len() }
 
 // MinTime / MaxTime 返回当前内存中样本的时间范围。
-func (db *DB) MinTime() int64 {
-	v := db.minTime.Load()
+func (h *Head) MinTime() int64 {
+	v := h.minTime.Load()
 	if v == math.MaxInt64 {
 		return math.MinInt64
 	}
 	return v
 }
 
-func (db *DB) MaxTime() int64 {
-	v := db.maxTime.Load()
+func (h *Head) MaxTime() int64 {
+	v := h.maxTime.Load()
 	if v == math.MinInt64 {
 		return math.MinInt64
 	}
@@ -308,82 +304,82 @@ func (db *DB) MaxTime() int64 {
 // appendableMinValidTime 返回当前允许写入的最小时间。
 // 语义对齐标准 Head：样本既不能落到已 flush/truncate 的边界之前，也不能
 // 落到当前可能正被 compact 的 compaction window 里。
-func (db *DB) appendableMinValidTime() int64 {
-	minValid := db.minValidTime.Load()
-	maxt := db.MaxTime()
+func (h *Head) appendableMinValidTime() int64 {
+	minValid := h.minValidTime.Load()
+	maxt := h.MaxTime()
 	if maxt == math.MinInt64 {
 		return minValid
 	}
 
-	cwEnd := maxt - db.opts.ChunkRange/2
+	cwEnd := maxt - h.opts.ChunkRange/2
 	if cwEnd > minValid {
 		return cwEnd
 	}
 	return minValid
 }
 
-func (db *DB) setMinValidTime(t int64) {
+func (h *Head) setMinValidTime(t int64) {
 	for {
-		cur := db.minValidTime.Load()
+		cur := h.minValidTime.Load()
 		if t <= cur {
 			return
 		}
-		if db.minValidTime.CompareAndSwap(cur, t) {
+		if h.minValidTime.CompareAndSwap(cur, t) {
 			return
 		}
 	}
 }
 
 // StartTime 用于兼容 storage.Storage 接口。
-func (db *DB) StartTime() (int64, error) {
-	if mt := db.MinTime(); mt != math.MinInt64 {
+func (h *Head) StartTime() (int64, error) {
+	if mt := h.MinTime(); mt != math.MinInt64 {
 		return mt, nil
 	}
 	return int64(0), nil
 }
 
 // Appender 返回一个新的写入 appender。
-func (db *DB) Appender(_ context.Context) storage.Appender {
-	return db.appenderPool.Get().(storage.Appender)
+func (h *Head) Appender(_ context.Context) storage.Appender {
+	return h.appenderPool.Get().(storage.Appender)
 }
 
 // ErrQuerierUnsupported 表示 LiteHead 不支持查询。
 var ErrQuerierUnsupported = errors.New("litehead: querier is not supported; query flushed blocks instead")
 
 // Querier 实现 storage.Storage 接口。LiteHead 本身不提供查询能力。
-func (db *DB) Querier(int64, int64) (storage.Querier, error) {
+func (h *Head) Querier(int64, int64) (storage.Querier, error) {
 	return nil, ErrQuerierUnsupported
 }
 
 // ChunkQuerier 实现 storage.Storage 接口。
-func (db *DB) ChunkQuerier(int64, int64) (storage.ChunkQuerier, error) {
+func (h *Head) ChunkQuerier(int64, int64) (storage.ChunkQuerier, error) {
 	return nil, ErrQuerierUnsupported
 }
 
 // ExemplarQuerier 实现 storage.Storage 接口。
-func (db *DB) ExemplarQuerier(context.Context) (storage.ExemplarQuerier, error) {
+func (h *Head) ExemplarQuerier(context.Context) (storage.ExemplarQuerier, error) {
 	return nil, ErrQuerierUnsupported
 }
 
 // createSeries 为新 labels 分配 ref + labelsID，并注册到 refTable / hashIndex。
 // 调用方需要保证同一 labels 不会并发创建（通过 hashIndex 的读锁 + 冷路径
 // 的乐观+CAS 式注册）。
-func (db *DB) createSeries(hash uint64, lset labels.Labels) *memSeries {
+func (h *Head) createSeries(hash uint64, lset labels.Labels) *memSeries {
 	// 1. labels 写入 arena。
-	labelsID := db.labelCat.put(lset)
+	labelsID := h.labelCat.put(lset)
 
 	// 2. 分配 ref。注意：nextRef 单调递增，首次分配从 1 开始。
-	ref := chunks.HeadSeriesRef(db.nextRef.Inc())
+	ref := chunks.HeadSeriesRef(h.nextRef.Inc())
 
-	s := db.seriesPool.Get().(*memSeries)
+	s := h.seriesPool.Get().(*memSeries)
 	*s = memSeries{
 		ref:      ref,
 		labelsID: labelsID,
 		lastTs:   math.MinInt64,
 	}
-	db.refTab.set(ref, s)
-	db.hashIdx.put(hash, ref, labelsID)
-	db.metrics.seriesActive.Inc()
+	h.refTab.set(ref, s)
+	h.hashIdx.put(hash, ref, labelsID)
+	h.metrics.seriesActive.Inc()
 	return s
 }
 
@@ -395,22 +391,22 @@ func rangeForTimestamp(t, width int64) int64 {
 
 // updateMinMaxTime 以原子方式更新 Head 的时间范围。
 // 命名对齐 tsdb.Head.updateMinMaxTime。
-func (db *DB) updateMinMaxTime(t int64) {
+func (h *Head) updateMinMaxTime(t int64) {
 	for {
-		cur := db.minTime.Load()
+		cur := h.minTime.Load()
 		if t >= cur {
 			break
 		}
-		if db.minTime.CompareAndSwap(cur, t) {
+		if h.minTime.CompareAndSwap(cur, t) {
 			break
 		}
 	}
 	for {
-		cur := db.maxTime.Load()
+		cur := h.maxTime.Load()
 		if t <= cur {
 			break
 		}
-		if db.maxTime.CompareAndSwap(cur, t) {
+		if h.maxTime.CompareAndSwap(cur, t) {
 			break
 		}
 	}

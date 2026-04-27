@@ -1,7 +1,3 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
 
 import (
@@ -28,7 +24,7 @@ import (
 // 元数据重建。本期实现里 sealed[] 的恢复被有意省略（稳态下每条 series
 // 只有 1~2 个 sealed chunk，WAL 已经记录了样本）。
 // TODO: 把 ChunkDiskMapper 中属于当前 Head 未 flush 的 chunk 关联回 writeSeries。
-func (db *DB) replayChunkDiskMapper() error {
+func (h *Head) replayChunkDiskMapper() error {
 	var maxRef chunks.HeadSeriesRef
 	iterFn := func(seriesRef chunks.HeadSeriesRef, _ chunks.ChunkDiskMapperRef, _, _ int64, _ uint16, _ chunkenc.Encoding, _ bool) error {
 		if seriesRef > maxRef {
@@ -36,13 +32,13 @@ func (db *DB) replayChunkDiskMapper() error {
 		}
 		return nil
 	}
-	err := db.chunkDiskMapper.IterateAllChunks(iterFn)
+	err := h.chunkDiskMapper.IterateAllChunks(iterFn)
 	if err != nil {
 		return errors.Wrap(err, "iterate chunk disk mapper")
 	}
 	// 这里只是做个兜底：后续 WAL replay 还会继续更新 nextRef。
-	if uint64(maxRef) > db.nextRef.Load() {
-		db.nextRef.Store(uint64(maxRef))
+	if uint64(maxRef) > h.nextRef.Load() {
+		h.nextRef.Store(uint64(maxRef))
 	}
 	return nil
 }
@@ -60,10 +56,10 @@ func (db *DB) replayChunkDiskMapper() error {
 // 不恢复 open chunk 会不会丢数据？——不会：关机前已 commit 的样本都在 WAL 里，
 // 下一次 flushWindow 从 WAL 流式读取窗口内样本喂给临时 RangeHead，最终落成 block。
 // 启动后的 lastTs 用来阻挡乱序样本。
-func (db *DB) replayWAL() error {
+func (h *Head) replayWAL() error {
 	start := time.Now()
 
-	dir, startFrom, err := wlog.LastCheckpoint(db.wal.Dir())
+	dir, startFrom, err := wlog.LastCheckpoint(h.wal.Dir())
 	if err != nil && !errors.Is(err, record.ErrNotFound) {
 		return errors.Wrap(err, "find last checkpoint")
 	}
@@ -73,34 +69,34 @@ func (db *DB) replayWAL() error {
 		if err != nil {
 			return errors.Wrap(err, "open checkpoint")
 		}
-		if err := db.loadWALSegments(wlog.NewReader(sr)); err != nil {
+		if err := h.loadWALSegments(wlog.NewReader(sr)); err != nil {
 			sr.Close()
 			return errors.Wrap(err, "replay checkpoint")
 		}
 		sr.Close()
 		startFrom++
-		level.Info(db.logger).Log("msg", "WAL checkpoint loaded")
+		level.Info(h.logger).Log("msg", "WAL checkpoint loaded")
 	}
 
-	_, last, err := wlog.Segments(db.wal.Dir())
+	_, last, err := wlog.Segments(h.wal.Dir())
 	if err != nil {
 		return errors.Wrap(err, "find WAL segments")
 	}
 	for i := startFrom; i <= last; i++ {
-		seg, err := wlog.OpenReadSegment(wlog.SegmentName(db.wal.Dir(), i))
+		seg, err := wlog.OpenReadSegment(wlog.SegmentName(h.wal.Dir(), i))
 		if err != nil {
 			return errors.Wrap(err, fmt.Sprintf("open WAL segment %d", i))
 		}
 		sr := wlog.NewSegmentBufReader(seg)
-		if err := db.loadWALSegments(wlog.NewReader(sr)); err != nil {
+		if err := h.loadWALSegments(wlog.NewReader(sr)); err != nil {
 			sr.Close()
 			return err
 		}
 		sr.Close()
-		level.Info(db.logger).Log("msg", "WAL segment loaded", "segment", i, "maxSegment", last)
+		level.Info(h.logger).Log("msg", "WAL segment loaded", "segment", i, "maxSegment", last)
 	}
 
-	db.metrics.walReplayDuration.Set(time.Since(start).Seconds())
+	h.metrics.walReplayDuration.Set(time.Since(start).Seconds())
 	return nil
 }
 
@@ -109,12 +105,12 @@ func (db *DB) replayWAL() error {
 // 只处理 Series 与 Samples。其它记录类型（Tombstones / Exemplars / Metadata /
 // HistogramSamples / FloatHistogramSamples / MmapMarkers 等）在 litehead 里
 // 当前都是 no-op，故 replay 阶段直接跳过，避免误更新 lastTs。
-func (db *DB) loadWALSegments(r *wlog.Reader) error {
+func (h *Head) loadWALSegments(r *wlog.Reader) error {
 	var (
 		dec     record.Decoder
 		lastRef atomic.Uint64
 	)
-	lastRef.Store(db.nextRef.Load())
+	lastRef.Store(h.nextRef.Load())
 
 	series := make([]record.RefSeries, 0, 128)
 	samples := make([]record.RefSample, 0, 1024)
@@ -131,10 +127,10 @@ func (db *DB) loadWALSegments(r *wlog.Reader) error {
 			for _, s := range series {
 				// 若 ref 在 WAL 里重复出现（例如 checkpoint 后重新写过），
 				// 保持先出现的那份；refTable 由 createSeriesWithRef 控制。
-				if db.refTab.get(s.Ref) != nil {
+				if h.refTab.get(s.Ref) != nil {
 					continue
 				}
-				db.createSeriesWithRef(s.Ref, s.Labels)
+				h.createSeriesWithRef(s.Ref, s.Labels)
 				if uint64(s.Ref) > lastRef.Load() {
 					lastRef.Store(uint64(s.Ref))
 				}
@@ -146,7 +142,7 @@ func (db *DB) loadWALSegments(r *wlog.Reader) error {
 				return &wlog.CorruptionErr{Err: errors.Wrap(err, "decode samples"), Segment: r.Segment(), Offset: r.Offset()}
 			}
 			for _, s := range samples {
-				ws := db.refTab.get(s.Ref)
+				ws := h.refTab.get(s.Ref)
 				if ws == nil {
 					// series 可能已经被 GC / checkpoint 剔除；跳过即可。
 					continue
@@ -154,7 +150,7 @@ func (db *DB) loadWALSegments(r *wlog.Reader) error {
 				if s.T > ws.lastTs {
 					ws.lastTs = s.T
 				}
-				db.updateMinMaxTime(s.T)
+				h.updateMinMaxTime(s.T)
 			}
 		default:
 			// Tombstones / Exemplars / Metadata / HistogramSamples /
@@ -165,27 +161,27 @@ func (db *DB) loadWALSegments(r *wlog.Reader) error {
 	if r.Err() != nil {
 		return errors.Wrap(r.Err(), "read WAL records")
 	}
-	if v := lastRef.Load(); v > db.nextRef.Load() {
-		db.nextRef.Store(v)
+	if v := lastRef.Load(); v > h.nextRef.Load() {
+		h.nextRef.Store(v)
 	}
 	return nil
 }
 
 // createSeriesWithRef 使用已知 ref 恢复 series。
 // 与 createSeries 的区别：不分配新 ref，也不触发 seriesCreated 统计。
-func (db *DB) createSeriesWithRef(ref chunks.HeadSeriesRef, lset labels.Labels) {
-	if db.refTab.get(ref) != nil {
+func (h *Head) createSeriesWithRef(ref chunks.HeadSeriesRef, lset labels.Labels) {
+	if h.refTab.get(ref) != nil {
 		return
 	}
-	labelsID := db.labelCat.put(lset)
+	labelsID := h.labelCat.put(lset)
 
-	s := db.seriesPool.Get().(*memSeries)
+	s := h.seriesPool.Get().(*memSeries)
 	*s = memSeries{
 		ref:      ref,
 		labelsID: labelsID,
 		lastTs:   math.MinInt64,
 	}
-	db.refTab.set(ref, s)
-	db.hashIdx.put(lset.Hash(), ref, labelsID)
-	db.metrics.seriesActive.Inc()
+	h.refTab.set(ref, s)
+	h.hashIdx.put(lset.Hash(), ref, labelsID)
+	h.metrics.seriesActive.Inc()
 }

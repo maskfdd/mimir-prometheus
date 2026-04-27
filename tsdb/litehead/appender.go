@@ -1,9 +1,4 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
-
 import (
 	"fmt"
 	"math"
@@ -22,7 +17,7 @@ import (
 
 // appender 是 LiteHead 对外暴露的 storage.Appender 实现。
 type appender struct {
-	db *DB
+	head *Head
 
 	// pending* 系列字段存放本次事务收集到的数据，Commit 时一次性写 WAL。
 	pendingSeries  []record.RefSeries
@@ -36,7 +31,7 @@ type appender struct {
 // 只要 hash 和 lset 能在 hashIndex 命中，就返回 (ref, lset)；
 // 未命中时返回 (0, EmptyLabels)。
 func (a *appender) GetRef(lset labels.Labels, hash uint64) (storage.SeriesRef, labels.Labels) {
-	if ref, ok := a.db.hashIdx.get(hash, lset, a.db.labelCat); ok {
+	if ref, ok := a.head.hashIdx.get(hash, lset, a.head.labelCat); ok {
 		return storage.SeriesRef(ref), lset
 	}
 	return 0, labels.EmptyLabels()
@@ -52,7 +47,7 @@ func (a *appender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v 
 
 	// 对齐标准 Head：任何落在 minValidTime 之前的样本都不能再写入。
 	// flush 开始后会先推进这个边界，避免样本错过 block 又被后续 truncate 清掉。
-	if t < a.db.appendableMinValidTime() {
+	if t < a.head.appendableMinValidTime() {
 		return 0, storage.ErrOutOfBounds
 	}
 
@@ -64,14 +59,14 @@ func (a *appender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v 
 	if (s.lastTs != math.MinInt64 && t <= s.lastTs) ||
 		(s.openChunk != nil && s.openChunk.NumSamples() > 0 && t <= s.openMaxT) {
 		s.mu.Unlock()
-		a.db.metrics.outOfOrderSamples.Inc()
+		a.head.metrics.outOfOrderSamples.Inc()
 		return 0, storage.ErrOutOfOrderSample
 	}
 
 	// open chunk 懒分配；必要时切新 chunk。
 	created := a.ensureOpenChunk(s, t, chunkenc.EncXOR)
 	if created {
-		a.db.metrics.chunksCreated.Inc()
+		a.head.metrics.chunksCreated.Inc()
 	}
 
 	if err := a.maybeCutChunk(s, t, chunkenc.EncXOR); err != nil {
@@ -128,8 +123,8 @@ func (a *appender) Commit() error {
 			s.lastTs = sam.T
 		}
 		s.mu.Unlock()
-		a.db.updateMinMaxTime(sam.T)
-		a.db.metrics.samplesAppended.Inc()
+		a.head.updateMinMaxTime(sam.T)
+		a.head.metrics.samplesAppended.Inc()
 	}
 	return nil
 }
@@ -149,7 +144,7 @@ func (a *appender) Rollback() error {
 func (a *appender) resolveSeries(ref storage.SeriesRef, lset labels.Labels) (*memSeries, error) {
 	if ref != 0 {
 		// 热路径：直接按 ref 查。
-		if s := a.db.refTab.get(chunks.HeadSeriesRef(ref)); s != nil {
+		if s := a.head.refTab.get(chunks.HeadSeriesRef(ref)); s != nil {
 			return s, nil
 		}
 		// ref 不存在，回退到冷路径。
@@ -164,19 +159,19 @@ func (a *appender) resolveSeries(ref storage.SeriesRef, lset labels.Labels) (*me
 	}
 
 	hash := lset.Hash()
-	if foundRef, ok := a.db.hashIdx.get(hash, lset, a.db.labelCat); ok {
-		if s := a.db.refTab.get(foundRef); s != nil {
+	if foundRef, ok := a.head.hashIdx.get(hash, lset, a.head.labelCat); ok {
+		if s := a.head.refTab.get(foundRef); s != nil {
 			return s, nil
 		}
 	}
 
 	// 真正新 series：创建并记录到 pending 里。
-	s := a.db.createSeries(hash, lset)
+	s := a.head.createSeries(hash, lset)
 	a.pendingSeries = append(a.pendingSeries, record.RefSeries{
 		Ref:    s.ref,
 		Labels: lset,
 	})
-	a.db.metrics.seriesCreated.Inc()
+	a.head.metrics.seriesCreated.Inc()
 	return s, nil
 }
 
@@ -214,7 +209,7 @@ func (a *appender) cutNewChunkLocked(s *memSeries, t int64, enc chunkenc.Encodin
 	s.openApp = app
 	s.openMinT = t
 	s.openMaxT = math.MinInt64
-	s.nextAt = rangeForTimestamp(t, a.db.opts.ChunkRange)
+	s.nextAt = rangeForTimestamp(t, a.head.opts.ChunkRange)
 	return true
 }
 
@@ -233,7 +228,7 @@ func (a *appender) maybeCutChunk(s *memSeries, t int64, enc chunkenc.Encoding) e
 	tooBig := enc == chunkenc.EncXOR && len(c.Bytes()) > maxBytesPerXORChunk
 
 	// 到达 chunkRange 边界或样本数超过 2x 上限时也切。
-	needCut := tooBig || t >= s.nextAt || numSamples >= a.db.opts.SamplesPerChunk*2 || c.Encoding() != enc
+	needCut := tooBig || t >= s.nextAt || numSamples >= a.head.opts.SamplesPerChunk*2 || c.Encoding() != enc
 
 	if !needCut {
 		return nil
@@ -243,7 +238,7 @@ func (a *appender) maybeCutChunk(s *memSeries, t int64, enc chunkenc.Encoding) e
 		return err
 	}
 	a.cutNewChunkLocked(s, t, enc)
-	a.db.metrics.chunksCreated.Inc()
+	a.head.metrics.chunksCreated.Inc()
 	return nil
 }
 
@@ -273,18 +268,18 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 	// 注意：释放 s.mu 后，openChunk / sealed[] / openApp 可能被其它
 	// appender 改动，所以 flush 回来后必须重新做一次状态检查。
 	for s.mmappedChunksCount >= maxMmappedChunksPerSeries {
-		a.db.metrics.mmappedChunksForcedFlush.Inc()
+		a.head.metrics.mmappedChunksForcedFlush.Inc()
 		// 在释放 s.mu 之前，先把当前 series 已知的最大时间更新到 db.maxTime，
 		// 否则 flushBlocking 看到的 MaxTime 不包含当前 batch 的 spill，
 		// 导致 flush 范围不够大、mmapped chunks 清不掉。
 		if s.openMaxT != math.MinInt64 {
-			a.db.updateMinMaxTime(s.openMaxT)
+			a.head.updateMinMaxTime(s.openMaxT)
 		}
 		for i := uint8(0); i < s.mmappedChunksCount; i++ {
-			a.db.updateMinMaxTime(s.mmappedChunks[i].maxTime)
+			a.head.updateMinMaxTime(s.mmappedChunks[i].maxTime)
 		}
 		s.mu.Unlock()
-		err := a.db.flushBlocking()
+		err := a.head.flushBlocking()
 		s.mu.Lock()
 		if err != nil {
 			return errors.Wrap(err, "forced flush on mmapped chunks overflow")
@@ -292,7 +287,7 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 		// flushBlocking 内部的 truncateMmapped 已经清理了 maxTime <= flushMaxt
 		// 的条目。如果 mmappedChunksCount 仍然满，做一次精确清理作为保底。
 		if s.mmappedChunksCount >= maxMmappedChunksPerSeries {
-			flushedMaxt := a.db.MaxTime()
+			flushedMaxt := a.head.MaxTime()
 			n := uint8(0)
 			for i := uint8(0); i < s.mmappedChunksCount; i++ {
 				if s.mmappedChunks[i].maxTime > flushedMaxt {
@@ -323,7 +318,7 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 	}
 
 	// WriteChunk 异步：用回调记录错误，但我们不在热路径等待。
-	chkRef := a.db.chunkDiskMapper.WriteChunk(s.ref, mint, maxt, c, false, nil)
+	chkRef := a.head.chunkDiskMapper.WriteChunk(s.ref, mint, maxt, c, false, nil)
 
 	s.mmappedChunks[s.mmappedChunksCount] = mmappedChunk{
 		ref:        chkRef,
@@ -335,7 +330,7 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 	s.mmappedChunksCount++
 	s.openChunk = nil
 	s.openApp = nil
-	a.db.metrics.chunksSealed.Inc()
+	a.head.metrics.chunksSealed.Inc()
 	return nil
 }
 
@@ -346,23 +341,23 @@ func (a *appender) logWAL() error {
 	}
 
 	var enc record.Encoder
-	pbuf := a.db.bufPool.Get().(*[]byte)
+	pbuf := a.head.bufPool.Get().(*[]byte)
 	buf := (*pbuf)[:0]
 	defer func() {
 		*pbuf = buf[:0]
-		a.db.bufPool.Put(pbuf)
+		a.head.bufPool.Put(pbuf)
 	}()
 
 	if len(a.pendingSeries) > 0 {
 		buf = enc.Series(a.pendingSeries, buf)
-		if err := a.db.wal.Log(buf); err != nil {
+		if err := a.head.wal.Log(buf); err != nil {
 			return errors.Wrap(err, "log WAL series")
 		}
 		buf = buf[:0]
 	}
 	if len(a.pendingSamples) > 0 {
 		buf = enc.Samples(a.pendingSamples, buf)
-		if err := a.db.wal.Log(buf); err != nil {
+		if err := a.head.wal.Log(buf); err != nil {
 			return errors.Wrap(err, "log WAL samples")
 		}
 		buf = buf[:0]
@@ -376,15 +371,15 @@ func (a *appender) logOnlyPendingSeries() error {
 		return nil
 	}
 	var enc record.Encoder
-	pbuf := a.db.bufPool.Get().(*[]byte)
+	pbuf := a.head.bufPool.Get().(*[]byte)
 	buf := (*pbuf)[:0]
 	defer func() {
 		*pbuf = buf[:0]
-		a.db.bufPool.Put(pbuf)
+		a.head.bufPool.Put(pbuf)
 	}()
 
 	buf = enc.Series(a.pendingSeries, buf)
-	return a.db.wal.Log(buf)
+	return a.head.wal.Log(buf)
 }
 
 // reset 清理 appender 状态并放回 pool。
@@ -392,5 +387,5 @@ func (a *appender) reset() {
 	a.pendingSeries = a.pendingSeries[:0]
 	a.pendingSamples = a.pendingSamples[:0]
 	a.sampleSeries = a.sampleSeries[:0]
-	a.db.appenderPool.Put(a)
+	a.head.appenderPool.Put(a)
 }

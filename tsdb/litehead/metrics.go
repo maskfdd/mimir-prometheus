@@ -1,12 +1,8 @@
-// Copyright 2026 The Prometheus Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-
 package litehead
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// dbMetrics 汇总 LiteHead 暴露给用户的监控指标。
+// headMetrics 汇总 LiteHead 暴露给用户的监控指标。
 //
 // 指标名、字段名均对齐标准 tsdb.Head 的 headMetrics / walMetrics /
 // checkpointMetrics，方便 mimir-ingester 替换时现有 Grafana 面板和告警规则
@@ -18,7 +14,7 @@ import "github.com/prometheus/client_golang/prometheus"
 //
 // litehead 特有的少数指标保留 prometheus_tsdb_litehead_* 前缀（labelCatalog、
 // mmappedChunksForcedFlush），因为标准 Head 里没有对应物。
-type dbMetrics struct {
+type headMetrics struct {
 	r prometheus.Registerer
 
 	// ===== 对齐 tsdb.Head 的指标（prometheus_tsdb_head_*）=====
@@ -51,8 +47,8 @@ type dbMetrics struct {
 	labelCatalogSymbolsCount prometheus.Gauge
 }
 
-func newDBMetrics(r prometheus.Registerer) *dbMetrics {
-	m := &dbMetrics{r: r}
+func newHeadMetrics(r prometheus.Registerer) *headMetrics {
+	m := &headMetrics{r: r}
 
 	// ---- prometheus_tsdb_head_* ----
 
@@ -158,7 +154,7 @@ func newDBMetrics(r prometheus.Registerer) *dbMetrics {
 	return m
 }
 
-func (m *dbMetrics) unregister() {
+func (m *headMetrics) unregister() {
 	if m == nil || m.r == nil {
 		return
 	}
