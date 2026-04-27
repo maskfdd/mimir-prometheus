@@ -26,8 +26,9 @@ func newTestHead(t *testing.T, opts *Options) (*Head, string) {
 	opts.SamplesPerChunk = 8
 	opts.NoLockfile = true
 
-	h, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
+	require.NoError(t, h.Init())
 	return h, dir
 }
 
@@ -54,7 +55,7 @@ func TestWriteAndReadBackViaFlush(t *testing.T) {
 
 	require.Equal(t, int64(1000), h.MinTime())
 	require.Equal(t, int64(3000), h.MaxTime())
-	require.Equal(t, 1, h.NumSeries())
+	require.Equal(t, uint64(1), h.NumSeries())
 
 	// 强制 flush 窗口 [0, BlockDuration-1]，写出 block。
 	require.NoError(t, h.tryFlushAll())
@@ -143,8 +144,9 @@ func TestRestartWALReplayRecoversSeries(t *testing.T) {
 	opts.BlockDuration = 60 * 1000
 	opts.SamplesPerChunk = 8
 	opts.NoLockfile = true
-	h2, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
+	require.NoError(t, h2.Init())
 	t.Cleanup(func() { _ = h2.Close() })
 
 	// 现在用相同 labels 做 GetRef 应该能拿到原来的 ref（或至少 series 已存在）。
@@ -208,8 +210,9 @@ func TestSealedOverflowDoesNotLoseData(t *testing.T) {
 	opts.BlockDuration = 60 * 1000 // 让 block 足够大，把所有样本都落到同一个 block
 	opts.NoLockfile = true
 	dir := t.TempDir()
-	h, err := Open(log.NewNopLogger(), nil, dir, opts)
+	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
+	require.NoError(t, h.Init())
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "hsealed")
@@ -256,8 +259,9 @@ func TestGCAfterFlushRemovesIdleSeries(t *testing.T) {
 	opts.NoLockfile = true
 	h, _ := func() (*Head, string) {
 		dir := t.TempDir()
-		d, err := Open(log.NewNopLogger(), nil, dir, opts)
+		d, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 		require.NoError(t, err)
+		require.NoError(t, d.Init())
 		return d, dir
 	}()
 	t.Cleanup(func() { _ = h.Close() })
@@ -274,14 +278,14 @@ func TestGCAfterFlushRemovesIdleSeries(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	require.Equal(t, 2, h.NumSeries())
+	require.Equal(t, uint64(2), h.NumSeries())
 
 	// 全量 flush，应把 [MinT, MaxT] 全部落成 block。
 	require.NoError(t, h.tryFlushAll())
 
 	// flush 后：两条 series 都没有 openChunk、没有 sealed[]、lastTs 已过窗口，
 	// 应该都被 GC 清掉。NumSeries 归零。
-	require.Equal(t, 0, h.NumSeries(),
+	require.Equal(t, uint64(0), h.NumSeries(),
 		"idle series should be garbage-collected after flush")
 
 	// 同样 labels 再次写入，应该会创建新的 series，不再复用旧 ref。

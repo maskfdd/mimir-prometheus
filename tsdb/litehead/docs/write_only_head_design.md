@@ -1,10 +1,12 @@
 ## LiteHead 设计文档
 
+如果你当前最关心的是“`litehead` 到底怎么创建、样本怎么写入、数据分别在内存/WAL/`chunks_head`/block 的哪一层”，建议先看：`litehead_write_path_overview.md`。
+
 这个包实现了一个 `LiteHead`。它只负责写入、切 chunk、写 WAL、落 block，不提供查询。目标很明确：**尽量压低 Head 的常驻内存，同时尽可能与标准 `tsdb.Head` 的外部语义对齐，方便作为 mimir-ingester 的替换项。**
 
 对照阅读的代码位置：
 
-- `tsdb/litehead/db.go`、`tsdb/litehead/appender.go`
+- `tsdb/litehead/head.go`、`tsdb/litehead/appender.go`
 - `tsdb/litehead/series.go`、`tsdb/litehead/label_catalog.go`
 - `tsdb/litehead/flush.go`、`tsdb/litehead/blockreader.go`
 - `tsdb/litehead/replay.go`、`tsdb/litehead/metrics.go`
@@ -51,7 +53,7 @@ LiteHead 的目标只有五条：
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                         DB                            │
+│                        Head                           │
 │                                                       │
 │  ┌──────────┐   ┌──────────┐                          │
 │  │  refTab  │   │  hashIdx │                          │
@@ -67,7 +69,7 @@ LiteHead 的目标只有五条：
 │                                                       │
 │  ChunkDiskMapper ◄── sealed chunk 字节                │
 │  WAL (wlog)     ◄── RefSeries / RefSample             │
-│  后台 goroutine ── 周期触发 compactHead / WAL truncate │
+│  外部调用方按需驱动 Flush / WAL truncate               │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -226,8 +228,8 @@ type mmappedChunk struct {
 1. `resolveSeries`：
    - `ref != 0` 时先查 `refTab`；命中直接返回
    - 未命中或 ref 不存在，按 labels 做 `HasDuplicateLabelNames`、`WithoutEmpty`，再查 `hashIdx`
-   - 仍未命中：`db.createSeries()` 分配 ref、写 labelCatalog、注册两张索引，并把 `RefSeries` 加到 `pendingSeries`
-2. `t < db.appendableMinValidTime()` 直接返回 `ErrOutOfBounds`
+   - 仍未命中：`head.createSeries()` 分配 ref、写 labelCatalog、注册两张索引，并把 `RefSeries` 加到 `pendingSeries`
+2. `t < head.appendableMinValidTime()` 直接返回 `ErrOutOfBounds`
 3. 取 `s.mu`，校验乱序：
    - 跨 batch：`s.lastTs != MinInt64 && t <= s.lastTs` → `ErrOutOfOrderSample`
    - batch 内：`s.openChunk` 非空时 `t <= s.openMaxT` → `ErrOutOfOrderSample`
@@ -272,10 +274,10 @@ type mmappedChunk struct {
 **`mmappedChunks[]` 满怎么办**（`maxMmappedChunksPerSeries = 8`）：这是一个特殊路径，绝不允许丢数据。
 
 - 临时释放 `s.mu`
-- 在释放前先把当前已知的 `openMaxT` 与所有 `mmappedChunks.maxTime` 推进到 `db.maxTime`，否则后续 flush 选择窗口时会看到一个过小的上界
-- 调 `db.flushBlocking()` 把当前所有样本同步 flush 成 block
+- 在释放前先把当前已知的 `openMaxT` 与所有 `mmappedChunks.maxTime` 推进到 `head.maxTime`，否则后续 flush 选择窗口时会看到一个过小的上界
+- 调 `head.flushBlocking()` 把当前所有样本同步 flush 成 block
 - 重新拿 `s.mu`，做一次保底扫描：`mmappedChunks[i].maxTime > flushedMaxt` 才保留
-- `db.flushBlocking` 里的 `compactHeadWindowOpts(gcSeries=false)` 只清 `mmappedChunks` / CDM，**不**回收 series，避免 appender 手里还握着 `*memSeries` 时被 UAF
+- `head.flushBlocking` 里的 `compactHeadWindowOpts(gcSeries=false)` 只清 `mmappedChunks` / CDM，**不**回收 series，避免 appender 手里还握着 `*memSeries` 时被 UAF
 - 计数器 `prometheus_tsdb_litehead_mmapped_chunks_forced_flush_total` 打点
 
 ---
@@ -286,24 +288,23 @@ type mmappedChunk struct {
 
 ### 6.1 触发与窗口选择
 
-后台 goroutine `db.run()` 以 `FlushCheckInterval` 周期 tick，命中 `shouldFlush` 后调用 `compactHead`：
+外部调用方通过 `IsCompactable()` 判断是否满足 flush 条件，满足时调用 `Flush()` 触发。判定条件与标准 Head 的 `compactable()` 一致：
 
 ```go
-// 与标准 Head.compactable() 一致：MaxT - MinT > 1.5 * ChunkRange 时压窗。
+// MaxT - MinT > 1.5 * ChunkRange 时可 flush。
 maxt-mint > (ChunkRange*3)/2
 ```
 
-每次 `compactHead` 切出左侧一个 `BlockDuration` 宽度的窗口 `[mint, rangeForTimestamp(mint, BlockDuration)-1]`，命名对齐 `tsdb.DB.compactHead`。
+`Flush()` 内部通过 `tryFlushAll()` 把所有满足条件的窗口逐一 compact 成 block。每个窗口宽度为 `BlockDuration`。
 
 ### 6.2 两类 flush 入口
 
 | 方法 | 场景 | `gcSeries` | 备注 |
 |------|------|-----------|------|
-| `compactHead()` | 后台周期 | `true` | 完整 GC：truncate → sweepDeadSeries |
+| `Flush()` / `tryFlushAll()` | 外部调用方定期调用 / `Close()` | 最后一个窗口 `true` | 完整 GC：truncate → sweepDeadSeries |
 | `flushBlocking()` | appender 触发的 forced flush | `false` | appender 还握着 `*memSeries`，不删 series |
-| `tryFlushAll()` | `Close()` | 最后一个窗口 `true` | 其余窗口 `false`，保证和 flushBlocking 一致 |
 
-三者都走 `compactHeadWindowOpts(mint, maxt, gcSeries)`，只是 GC 策略不同。
+两者都走 `compactHeadWindowOpts(mint, maxt, gcSeries)`，只是 GC 策略不同。
 
 ### 6.3 `compactHeadWindowOpts` 关键步骤
 
@@ -339,7 +340,7 @@ maxt-mint > (ChunkRange*3)/2
 
 - `Index()` → `indexReader`：
   - `Postings` 只可靠支持 `AllPostings`（compactor 实际会调的形态）
-  - `SortedPostings` 基于快照重排
+  - `SortedPostings` 在 AllPostings 路径下变为 no-op：series 在 newBlockReader 阶段已按 labels 排序
   - `ShardedPostings` 用 `labels.StableHash` 过滤
   - `Series(ref, builder, chks)` 按快照返回 labels 和 `chunks.Meta`（open chunk 的 `MaxTime = MaxInt64`，对齐原生"可增长"语义）
   - 其它 `LabelNames/LabelValues/PostingsForMatchers` 为防御式实现，compactor 不会走到
@@ -371,7 +372,7 @@ return max(minValidTime, cwEnd)
 
 重启恢复时只重建映射关系和最后时间戳，**不重建 open chunk**。
 
-`Open` 时依次做：
+`NewHead` + `Init` 时依次做：
 
 1. **`replayChunkDiskMapper`**：遍历所有 head chunk，拿到最大的 `HeadSeriesRef`，用来恢复 `nextRef`（后续 WAL replay 还会继续更新）
 2. **`replayWAL`**：先加载 checkpoint，再逐段读 WAL 段
@@ -391,7 +392,7 @@ return max(minValidTime, cwEnd)
 
 | 文件 | 内容 | 现状行数 |
 |------|------|---------|
-| `db.go` | `DB` 结构、`Open/Close`、`createSeries`、`appendableMinValidTime`、`updateMinMaxTime` | ~420 |
+| `head.go` | `Head` 结构、`NewHead/Init/Close`、`createSeries`、`appendableMinValidTime`、`updateMinMaxTime` | ~500 |
 | `appender.go` | `storage.Appender` 实现、chunk 切分与 spill、forced flush | ~400 |
 | `series.go` | `memSeries`、`refTable`、`hashIndex`、`mmappedChunk` | ~235 |
 | `label_catalog.go` | `labelCatalog` + `symbolTable` | ~250 |
@@ -402,7 +403,7 @@ return max(minValidTime, cwEnd)
 
 补充：
 
-- 通过独立包切换，调用方选择性注入 `litehead.DB` 代替 `tsdb.Head`
+- 通过独立包切换，调用方选择性注入 `litehead.Head` 代替 `tsdb.Head`
 - 尽量复用现有能力：`storage.Appender` 接口、WAL 记录格式、`ChunkDiskMapper`、`chunkenc`、`tsdb.LeveledCompactor`、block 目录格式
 
 ---
@@ -449,7 +450,7 @@ return max(minValidTime, cwEnd)
 - **`appendableMinValidTime`**：包含 `minValidTime` + compaction window 保护
 - **`MinTime/MaxTime`** 命名与返回值一致（空态返回 `MinInt64`）
 - **chunk 切分触发条件**：`nextAt` / `2x SamplesPerChunk` / XOR 字节上限 / 编码变化
-- **compactHead 窗口选择**：`MaxT - MinT > 1.5 * ChunkRange`
+- **flush 触发条件**：`MaxT - MinT > 1.5 * ChunkRange`，由外部调用方通过 `IsCompactable()` + `Flush()` 驱动
 - **truncate 流程**：`truncateMemory` + `truncateWAL`（checkpoint 再删旧段）
 - **metrics**：`prometheus_tsdb_head_*`、`prometheus_tsdb_compactions_*`、`prometheus_tsdb_wal_truncate_duration_seconds`、`prometheus_tsdb_checkpoint_*`、`prometheus_tsdb_data_replay_duration_seconds` 均命名一致，面板/告警不用改
 

@@ -2,23 +2,13 @@ package litehead
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// headMetrics 汇总 LiteHead 暴露给用户的监控指标。
-//
-// 指标名、字段名均对齐标准 tsdb.Head 的 headMetrics / walMetrics /
-// checkpointMetrics，方便 mimir-ingester 替换时现有 Grafana 面板和告警规则
-// 无需修改：
-//
-//   - prometheus_tsdb_head_*         : Head 本身（series / chunks / samples / compactions）
-//   - prometheus_tsdb_wal_*          : WAL truncate
-//   - prometheus_tsdb_checkpoint_*   : Checkpoint 创建
-//
-// litehead 特有的少数指标保留 prometheus_tsdb_litehead_* 前缀（labelCatalog、
-// mmappedChunksForcedFlush），因为标准 Head 里没有对应物。
+// headMetrics 汇总 Head 暴露的监控指标。
+// 指标名对齐标准 tsdb.Head（prometheus_tsdb_head_* / wal / checkpoint），
+// litehead 特有指标使用 prometheus_tsdb_litehead_* 前缀。
 type headMetrics struct {
 	r prometheus.Registerer
 
-	// ===== 对齐 tsdb.Head 的指标（prometheus_tsdb_head_*）=====
-
+	// Head 指标（prometheus_tsdb_head_*）
 	seriesActive      prometheus.Gauge
 	seriesCreated     prometheus.Counter
 	seriesRemoved     prometheus.Counter
@@ -31,20 +21,20 @@ type headMetrics struct {
 	compactionsFailed    prometheus.Counter
 	compactionDuration   prometheus.Summary
 
-	// ===== 对齐 WAL / checkpoint 的指标 =====
-
+	// WAL / checkpoint 指标
 	walReplayDuration       prometheus.Gauge
 	walTruncateDuration     prometheus.Summary
 	checkpointCreationTotal prometheus.Counter
 	checkpointCreationFail  prometheus.Counter
 
-	// ===== litehead 特有指标（prometheus_tsdb_litehead_*）=====
-
+	// litehead 特有指标（prometheus_tsdb_litehead_*）
 	mmappedChunksForcedFlush prometheus.Counter
 	labelCatalogSize         prometheus.Gauge
 	labelCatalogCount        prometheus.Gauge
 	labelCatalogSymbolsSize  prometheus.Gauge
 	labelCatalogSymbolsCount prometheus.Gauge
+
+	snapshotLoadDuration prometheus.Gauge
 }
 
 func newHeadMetrics(r prometheus.Registerer) *headMetrics {
@@ -138,6 +128,10 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 		Name: "prometheus_tsdb_litehead_label_catalog_symbols_total",
 		Help: "Number of distinct label name/value strings interned by the lite head symbol table.",
 	})
+	m.snapshotLoadDuration = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_litehead_snapshot_load_duration_seconds",
+		Help: "Time taken to load the lite snapshot on startup.",
+	})
 
 	if r != nil {
 		r.MustRegister(
@@ -149,6 +143,7 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 			m.checkpointCreationTotal, m.checkpointCreationFail,
 			m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
 			m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
+			m.snapshotLoadDuration,
 		)
 	}
 	return m
@@ -167,6 +162,7 @@ func (m *headMetrics) unregister() {
 		m.checkpointCreationTotal, m.checkpointCreationFail,
 		m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
 		m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
+		m.snapshotLoadDuration,
 	} {
 		m.r.Unregister(c)
 	}

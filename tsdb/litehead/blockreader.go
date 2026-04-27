@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
@@ -18,52 +19,43 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 )
 
-// blockReader 让 litehead.Head 直接以 tsdb.BlockReader 身份
-// 喂给 LeveledCompactor.Write，省掉 "临时 Head + WAL 回放" 那一趟复制。
+// blockReader 把 litehead.Head 包装成 tsdb.BlockReader，
+// 直接喂给 LeveledCompactor.Write。
 //
-// 生命周期：每次 compactHeadWindow 调用时新建，写完 block 就丢。
-// 快照在 newBlockReader 里一次性采集；后续 Postings / Series /
-// Chunk 都从这份快照取，不再回 Head 的主索引（refTab/hashIdx），避免
-// flush 期间的并发追加 / spill 把状态改掉。
-//
-// 并发模型：flush 与 appender 之间靠 h.flushMtx 互斥 compact 本身，
-// 但 append 仍可能并行写同一条 series 的 open chunk。Chunk(meta) 读
-// open chunk 字节时用 s.mu 保护 + bytes copy，避开和 appender 的竞争。
-// mmappedChunks 一旦 spill 到 ChunkDiskMapper 就不可变，直接 cdm.Chunk
-// 读即可。
+// 快照在 newBlockReader 时一次性采集，后续读操作不再回主索引。
 type blockReader struct {
 	head       *Head
 	mint, maxt int64
 
 	meta tsdb.BlockMeta
 
-	// series 快照：按 labels 排序（AllPostings 和 SortedPostings 可以直接用）。
-	// Series(ref) 用 refToIdx 映射到这份快照。
-	series    []*seriesSnapshot
-	refToIdx  map[storage.SeriesRef]int
-	symbolSet []string // 去重且已排序的 symbols
+	series    []*seriesSnapshot // 按 labels 排序
+	symbolSet []string
+
+	refIndex []refIndexEntry // 按 ref 排序，用于二分查找
 }
 
-// seriesSnapshot 是一条 series 在 flush 开始那一瞬间的只读投影。
-// 构造完成后 chunks 数组本身不变；mmapped chunk 直接读 ChunkDiskMapper，
-// open chunk 的字节在快照阶段就冻结下来，避免后续 spill / append 改写。
+// refIndexEntry 存储 series ref 到 series 切片下标的映射。
+type refIndexEntry struct {
+	ref chunks.HeadSeriesRef
+	idx int
+}
+
+// seriesSnapshot 是 series 在 flush 时的只读投影。
 type seriesSnapshot struct {
-	ref  chunks.HeadSeriesRef
-	lset labels.Labels
-	// chunks 按 chunk id 顺序排列：先是 mmappedChunks[0..n)，最后 1 个
-	// 是 open chunk（若存在）。chunk ref 用 chunks.NewHeadChunkRef(ref, id)。
-	chunks []chunkDescriptor
+	ref      chunks.HeadSeriesRef
+	labelsID uint32
+	chunks   []chunkDescriptor
 }
 
-// chunkDescriptor 是 chunks.Meta 的最小信息。Chunk() 方法按 kind 分发。
 type chunkDescriptor struct {
 	minTime int64
-	maxTime int64 // open chunk 的 maxTime 在 Meta 里会被改成 MaxInt64
+	maxTime int64
 
 	kind         chunkSource
-	mmappedRef   chunks.ChunkDiskMapperRef // 仅当 kind == chunkSourceMmapped 时有效
-	openEncoding chunkenc.Encoding         // 仅当 kind == chunkSourceOpen 时有效
-	openBytes    []byte                    // 仅当 kind == chunkSourceOpen 时有效
+	mmappedRef   chunks.ChunkDiskMapperRef
+	openEncoding chunkenc.Encoding
+	openBytes    []byte
 }
 
 type chunkSource uint8
@@ -73,17 +65,13 @@ const (
 	chunkSourceOpen
 )
 
-// newBlockReader 构造快照。
-// 不能在 refTab.forEach 的回调里再取主锁，参见 refTab.forEach 注释。
+// newBlockReader 采集 series 快照。
 func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 	r := &blockReader{
-		head:     h,
-		mint:     mint,
-		maxt:     maxt,
-		refToIdx: make(map[storage.SeriesRef]int, 1024),
+		head: h,
+		mint: mint,
+		maxt: maxt,
 	}
-
-	symbols := make(map[string]struct{}, 256)
 
 	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
@@ -111,7 +99,7 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 				b := s.openChunk.Bytes()
 				frozen := make([]byte, len(b))
 				copy(frozen, b)
-				// 对齐标准 Head 的对外语义：仍把 open chunk 暴露成“可增长”块。
+				// 对齐标准 Head 的对外语义：仍把 open chunk 暴露成"可增长"块。
 				// 真正的字节和编码已经在快照阶段冻结，避免 Chunk() 再回看 live 状态。
 				descs = append(descs, chunkDescriptor{
 					minTime:      openMinT,
@@ -126,45 +114,63 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 			s.mu.Unlock()
 			return
 		}
-		lset := h.labelCat.get(s.labelsID)
 		snap := &seriesSnapshot{
-			ref:    s.ref,
-			lset:   lset,
-			chunks: descs,
+			ref:      s.ref,
+			labelsID: s.labelsID,
+			chunks:   descs,
 		}
 		s.mu.Unlock()
 
-		lset.Range(func(l labels.Label) {
-			symbols[l.Name] = struct{}{}
-			symbols[l.Value] = struct{}{}
-		})
-
-		r.refToIdx[storage.SeriesRef(snap.ref)] = len(r.series)
 		r.series = append(r.series, snap)
 	})
 
-	// 按 labels.Compare 排序；compactor 要求 SortedPostings 的顺序稳定。
+	// 按 labels 排序。
 	slices.SortFunc(r.series, func(a, b *seriesSnapshot) int {
-		return labels.Compare(a.lset, b.lset)
+		return h.labelCat.compare(a.labelsID, b.labelsID)
 	})
-	for i := range r.series {
-		r.refToIdx[storage.SeriesRef(r.series[i].ref)] = i
-	}
 
-	r.symbolSet = make([]string, 0, len(symbols))
-	for s := range symbols {
+	// 构建 refIndex。
+	r.refIndex = make([]refIndexEntry, len(r.series))
+	for i, snap := range r.series {
+		r.refIndex[i] = refIndexEntry{ref: snap.ref, idx: i}
+	}
+	sort.Slice(r.refIndex, func(i, j int) bool {
+		return r.refIndex[i].ref < r.refIndex[j].ref
+	})
+
+	// 收集 symbols。
+	symbolSet := make(map[string]struct{}, 256)
+	for _, snap := range r.series {
+		lset := h.labelCat.get(snap.labelsID)
+		lset.Range(func(l labels.Label) {
+			symbolSet[l.Name] = struct{}{}
+			symbolSet[l.Value] = struct{}{}
+		})
+	}
+	r.symbolSet = make([]string, 0, len(symbolSet))
+	for s := range symbolSet {
 		r.symbolSet = append(r.symbolSet, s)
 	}
 	slices.Sort(r.symbolSet)
 
-	// ULID 只在日志/错误里露脸；真正写入 meta.json 的 ULID 由 compactor
-	// 的 outBlocks[0].meta 掌控，与这个无关。
 	r.meta = tsdb.BlockMeta{
 		ULID:    ulid.ULID{},
 		MinTime: mint,
 		MaxTime: maxt,
 	}
 	return r
+}
+
+// lookupRef 二分查找 ref 在 series 切片中的下标。
+func (r *blockReader) lookupRef(ref storage.SeriesRef) (int, bool) {
+	sref := chunks.HeadSeriesRef(ref)
+	i := sort.Search(len(r.refIndex), func(i int) bool {
+		return r.refIndex[i].ref >= sref
+	})
+	if i < len(r.refIndex) && r.refIndex[i].ref == sref {
+		return r.refIndex[i].idx, true
+	}
+	return 0, false
 }
 
 // seriesOverlapsWindowLocked 判断 series 在 [mint, maxt] 范围内有没有可读样本。
@@ -214,67 +220,51 @@ func (ir *indexReader) Symbols() index.StringIter {
 	return index.NewStringListIter(ir.r.symbolSet)
 }
 
-// Postings 只支持 AllPostingsKey("" / "")，这是 compactor 唯一会调的形态。
-// 其它 name/value 精确查询在本 reader 场景下不会被触发；即便意外被调到，
-// 返回 EmptyPostings 也只是让 compactor 少写一点，不会 panic。
-func (ir *indexReader) Postings(ctx context.Context, name string, values ...string) (index.Postings, error) {
-	switch len(values) {
-	case 0:
+// Postings 返回匹配 name/values 的 series refs。
+func (ir *indexReader) Postings(_ context.Context, name string, values ...string) (index.Postings, error) {
+	if len(values) == 0 {
 		return index.EmptyPostings(), nil
-	case 1:
-		refs := make([]storage.SeriesRef, 0, len(ir.r.series))
-		for _, s := range ir.r.series {
-			if s.lset.Get(name) == values[0] {
-				refs = append(refs, storage.SeriesRef(s.ref))
-			}
+	}
+
+	// AllPostingsKey 快速路径：name == "" && values == [""]
+	if name == "" && len(values) == 1 && values[0] == "" {
+		refs := make([]storage.SeriesRef, len(ir.r.series))
+		for i, s := range ir.r.series {
+			refs[i] = storage.SeriesRef(s.ref)
 		}
 		return index.NewListPostings(refs), nil
-	default:
-		res := make([]index.Postings, 0, len(values))
-		for _, value := range values {
-			p, err := ir.Postings(ctx, name, value)
-			if err != nil {
-				return nil, err
-			}
-			if !index.IsEmptyPostingsType(p) {
-				res = append(res, p)
-			}
-		}
-		return index.Merge(ctx, res...), nil
 	}
+
+	// 通用 fallback：线性扫描匹配。
+	valSet := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		valSet[v] = struct{}{}
+	}
+	refs := make([]storage.SeriesRef, 0, len(ir.r.series))
+	for _, s := range ir.r.series {
+		lset := ir.r.head.labelCat.get(s.labelsID)
+		if _, ok := valSet[lset.Get(name)]; ok {
+			refs = append(refs, storage.SeriesRef(s.ref))
+		}
+	}
+	return index.NewListPostings(refs), nil
 }
 
+// SortedPostings：series 已按 labels 排序，直接 pass-through。
 func (ir *indexReader) SortedPostings(p index.Postings) index.Postings {
-	series := make([]*seriesSnapshot, 0, 128)
-	for p.Next() {
-		idx, ok := ir.r.refToIdx[p.At()]
-		if !ok {
-			continue
-		}
-		series = append(series, ir.r.series[idx])
-	}
-	if err := p.Err(); err != nil {
-		return index.ErrPostings(err)
-	}
-	slices.SortFunc(series, func(a, b *seriesSnapshot) int {
-		return labels.Compare(a.lset, b.lset)
-	})
-	refs := make([]storage.SeriesRef, 0, len(series))
-	for _, s := range series {
-		refs = append(refs, storage.SeriesRef(s.ref))
-	}
-	return index.NewListPostings(refs)
+	return p
 }
 
 func (ir *indexReader) ShardedPostings(p index.Postings, shardIndex, shardCount uint64) index.Postings {
 	var out []storage.SeriesRef
 	for p.Next() {
 		ref := p.At()
-		idx, ok := ir.r.refToIdx[ref]
+		idx, ok := ir.r.lookupRef(ref)
 		if !ok {
 			continue
 		}
-		if labels.StableHash(ir.r.series[idx].lset)%shardCount != shardIndex {
+		lset := ir.r.head.labelCat.get(ir.r.series[idx].labelsID)
+		if labels.StableHash(lset)%shardCount != shardIndex {
 			continue
 		}
 		out = append(out, ref)
@@ -283,14 +273,15 @@ func (ir *indexReader) ShardedPostings(p index.Postings, shardIndex, shardCount 
 }
 
 func (ir *indexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
-	idx, ok := ir.r.refToIdx[ref]
+	idx, ok := ir.r.lookupRef(ref)
 	if !ok {
 		return storage.ErrNotFound
 	}
 	snap := ir.r.series[idx]
 
+	lset := ir.r.head.labelCat.get(snap.labelsID)
 	builder.Reset()
-	snap.lset.Range(func(l labels.Label) {
+	lset.Range(func(l labels.Label) {
 		builder.Add(l.Name, l.Value)
 	})
 
@@ -308,8 +299,7 @@ func (ir *indexReader) Series(ref storage.SeriesRef, builder *labels.ScratchBuil
 	return nil
 }
 
-// 下面这些方法 compactor 不会调，但 IndexReader 接口要求齐全。
-// 给出能 work 的朴素实现以防外部代码误调。
+// 以下方法 compactor 不会调用，提供朴素实现满足接口要求。
 
 func (ir *indexReader) SortedLabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
 	v, err := ir.LabelValues(ctx, name, matchers...)
@@ -323,7 +313,8 @@ func (ir *indexReader) SortedLabelValues(ctx context.Context, name string, match
 func (ir *indexReader) LabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, s := range ir.r.series {
-		if v := s.lset.Get(name); v != "" {
+		lset := ir.r.head.labelCat.get(s.labelsID)
+		if v := lset.Get(name); v != "" {
 			set[v] = struct{}{}
 		}
 	}
@@ -337,7 +328,8 @@ func (ir *indexReader) LabelValues(ctx context.Context, name string, matchers ..
 func (ir *indexReader) LabelNames(ctx context.Context, matchers ...*labels.Matcher) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, s := range ir.r.series {
-		s.lset.Range(func(l labels.Label) {
+		lset := ir.r.head.labelCat.get(s.labelsID)
+		lset.Range(func(l labels.Label) {
 			set[l.Name] = struct{}{}
 		})
 	}
@@ -352,9 +344,10 @@ func (ir *indexReader) LabelNames(ctx context.Context, matchers ...*labels.Match
 func (ir *indexReader) PostingsForMatchers(ctx context.Context, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
 	var refs []storage.SeriesRef
 	for _, s := range ir.r.series {
+		lset := ir.r.head.labelCat.get(s.labelsID)
 		match := true
 		for _, m := range ms {
-			if !m.Matches(s.lset.Get(m.Name)) {
+			if !m.Matches(lset.Get(m.Name)) {
 				match = false
 				break
 			}
@@ -367,11 +360,12 @@ func (ir *indexReader) PostingsForMatchers(ctx context.Context, concurrent bool,
 }
 
 func (ir *indexReader) LabelValueFor(_ context.Context, id storage.SeriesRef, label string) (string, error) {
-	idx, ok := ir.r.refToIdx[id]
+	idx, ok := ir.r.lookupRef(id)
 	if !ok {
 		return "", storage.ErrNotFound
 	}
-	v := ir.r.series[idx].lset.Get(label)
+	lset := ir.r.head.labelCat.get(ir.r.series[idx].labelsID)
+	v := lset.Get(label)
 	if v == "" {
 		return "", storage.ErrNotFound
 	}
@@ -381,11 +375,12 @@ func (ir *indexReader) LabelValueFor(_ context.Context, id storage.SeriesRef, la
 func (ir *indexReader) LabelNamesFor(ctx context.Context, ids ...storage.SeriesRef) ([]string, error) {
 	set := make(map[string]struct{}, 16)
 	for _, id := range ids {
-		idx, ok := ir.r.refToIdx[id]
+		idx, ok := ir.r.lookupRef(id)
 		if !ok {
 			return nil, storage.ErrNotFound
 		}
-		ir.r.series[idx].lset.Range(func(l labels.Label) {
+		lset := ir.r.head.labelCat.get(ir.r.series[idx].labelsID)
+		lset.Range(func(l labels.Label) {
 			set[l.Name] = struct{}{}
 		})
 	}
@@ -407,7 +402,7 @@ func (cr *chunkReader) Close() error { return nil }
 
 func (cr *chunkReader) Chunk(meta chunks.Meta) (chunkenc.Chunk, error) {
 	sref, cid := chunks.HeadChunkRef(meta.Ref).Unpack()
-	idx, ok := cr.r.refToIdx[storage.SeriesRef(sref)]
+	idx, ok := cr.r.lookupRef(storage.SeriesRef(sref))
 	if !ok {
 		return nil, storage.ErrNotFound
 	}
