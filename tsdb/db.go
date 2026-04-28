@@ -240,6 +240,32 @@ type Options struct {
 	// SecondaryHashFunction is an optional function that is applied to each series in the Head.
 	// Values returned from this function are preserved and available by calling ForEachSecondaryHash function on the Head.
 	SecondaryHashFunction func(labels.Labels) uint32
+
+	// UseLiteHead, when true, uses the built-in litehead (write-only Head) instead
+	// of the standard Head. This is a convenience flag that internally resolves to
+	// the litehead factory registered via RegisterNewHeadFn("litehead", ...).
+	//
+	// For this to work, the litehead package must be imported (blank import is enough):
+	//
+	//   import _ "github.com/prometheus/prometheus/tsdb/litehead"
+	//
+	// If both UseLiteHead and NewHeadFn are set, NewHeadFn takes precedence.
+	UseLiteHead bool
+
+	// NewHeadFn, if set, overrides the default Head creation with a custom HeadLike constructor.
+	// This allows injecting an alternative Head implementation (e.g. litehead) without
+	// introducing a circular import from tsdb -> litehead -> tsdb.
+	//
+	// The function receives:
+	//   - logger, registerer: for logging and metrics
+	//   - dir: the TSDB data directory
+	//   - opts: the full DB options (the factory can extract relevant fields)
+	//   - rngs: the block ranges
+	//
+	// When set, the DB skips standard Head + WAL creation and uses the returned HeadLike.
+	// The factory is responsible for creating its own WAL if needed.
+	// When nil (default), the standard Head is created.
+	NewHeadFn func(l log.Logger, r prometheus.Registerer, dir string, opts *Options, rngs []int64) (HeadLike, error)
 }
 
 type BlocksToDeleteFunc func(blocks []*Block) map[ulid.ULID]struct{}
@@ -881,62 +907,82 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	}
 	db.compactCancel = cancel
 
+	// Resolve the HeadLike factory: explicit NewHeadFn > UseLiteHead > standard Head.
+	newHeadFn := opts.NewHeadFn
+	if newHeadFn == nil && opts.UseLiteHead {
+		newHeadFn = GetNewHeadFn("litehead")
+		if newHeadFn == nil {
+			return nil, errors.New("UseLiteHead is true but litehead factory is not registered; import _ \"github.com/prometheus/prometheus/tsdb/litehead\"")
+		}
+	}
+
 	var wal, wbl *wlog.WL
-	segmentSize := wlog.DefaultSegmentSize
-	// Wal is enabled.
-	if opts.WALSegmentSize >= 0 {
-		// Wal is set to a custom size.
-		if opts.WALSegmentSize > 0 {
-			segmentSize = opts.WALSegmentSize
-		}
-		wal, err = wlog.NewSize(l, r, walDir, segmentSize, opts.WALCompression)
-		if err != nil {
-			return nil, err
-		}
-		// Check if there is a WBL on disk, in which case we should replay that data.
-		wblSize, err := fileutil.DirSize(wblDir)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, err
-		}
-		if opts.OutOfOrderTimeWindow > 0 || wblSize > 0 {
-			wbl, err = wlog.NewSize(l, r, wblDir, segmentSize, opts.WALCompression)
+	if newHeadFn == nil {
+		segmentSize := wlog.DefaultSegmentSize
+		// Wal is enabled.
+		if opts.WALSegmentSize >= 0 {
+			// Wal is set to a custom size.
+			if opts.WALSegmentSize > 0 {
+				segmentSize = opts.WALSegmentSize
+			}
+			wal, err = wlog.NewSize(l, r, walDir, segmentSize, opts.WALCompression)
 			if err != nil {
 				return nil, err
 			}
+			// Check if there is a WBL on disk, in which case we should replay that data.
+			wblSize, err := fileutil.DirSize(wblDir)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+			if opts.OutOfOrderTimeWindow > 0 || wblSize > 0 {
+				wbl, err = wlog.NewSize(l, r, wblDir, segmentSize, opts.WALCompression)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
-	db.oooWasEnabled.Store(opts.OutOfOrderTimeWindow > 0)
-	headOpts := DefaultHeadOptions()
-	headOpts.ChunkRange = rngs[0]
-	headOpts.ChunkDirRoot = dir
-	headOpts.ChunkPool = db.chunkPool
-	headOpts.ChunkWriteBufferSize = opts.HeadChunksWriteBufferSize
-	headOpts.ChunkEndTimeVariance = opts.HeadChunksEndTimeVariance
-	headOpts.ChunkWriteQueueSize = opts.HeadChunksWriteQueueSize
-	headOpts.SamplesPerChunk = opts.SamplesPerChunk
-	headOpts.StripeSize = opts.StripeSize
-	headOpts.SeriesCallback = opts.SeriesLifecycleCallback
-	headOpts.EnableExemplarStorage = opts.EnableExemplarStorage
-	headOpts.MaxExemplars.Store(opts.MaxExemplars)
-	headOpts.EnableMemorySnapshotOnShutdown = opts.EnableMemorySnapshotOnShutdown
-	headOpts.EnableNativeHistograms.Store(opts.EnableNativeHistograms)
-	headOpts.OutOfOrderTimeWindow.Store(opts.OutOfOrderTimeWindow)
-	headOpts.OutOfOrderCapMax.Store(opts.OutOfOrderCapMax)
-	headOpts.PostingsForMatchersCacheTTL = opts.HeadPostingsForMatchersCacheTTL
-	headOpts.PostingsForMatchersCacheMaxItems = opts.HeadPostingsForMatchersCacheMaxItems
-	headOpts.PostingsForMatchersCacheMaxBytes = opts.HeadPostingsForMatchersCacheMaxBytes
-	headOpts.PostingsForMatchersCacheForce = opts.HeadPostingsForMatchersCacheForce
-	headOpts.SecondaryHashFunction = opts.SecondaryHashFunction
-	if opts.WALReplayConcurrency > 0 {
-		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
-	}
-	if opts.IsolationDisabled {
-		// We only override this flag if isolation is disabled at DB level. We use the default otherwise.
-		headOpts.IsolationDisabled = opts.IsolationDisabled
-	}
-	db.head, err = NewHead(r, l, wal, wbl, headOpts, stats.Head)
-	if err != nil {
-		return nil, err
+	db.oooWasEnabled.Store(newHeadFn == nil && opts.OutOfOrderTimeWindow > 0)
+
+	if newHeadFn != nil {
+		// Use the custom Head constructor (e.g. litehead).
+		db.head, err = newHeadFn(l, r, dir, opts, rngs)
+		if err != nil {
+			return nil, errors.Wrap(err, "create custom head")
+		}
+	} else {
+		// Create standard Head.
+		headOpts := DefaultHeadOptions()
+		headOpts.ChunkRange = rngs[0]
+		headOpts.ChunkDirRoot = dir
+		headOpts.ChunkPool = db.chunkPool
+		headOpts.ChunkWriteBufferSize = opts.HeadChunksWriteBufferSize
+		headOpts.ChunkEndTimeVariance = opts.HeadChunksEndTimeVariance
+		headOpts.ChunkWriteQueueSize = opts.HeadChunksWriteQueueSize
+		headOpts.SamplesPerChunk = opts.SamplesPerChunk
+		headOpts.StripeSize = opts.StripeSize
+		headOpts.SeriesCallback = opts.SeriesLifecycleCallback
+		headOpts.EnableExemplarStorage = opts.EnableExemplarStorage
+		headOpts.MaxExemplars.Store(opts.MaxExemplars)
+		headOpts.EnableMemorySnapshotOnShutdown = opts.EnableMemorySnapshotOnShutdown
+		headOpts.EnableNativeHistograms.Store(opts.EnableNativeHistograms)
+		headOpts.OutOfOrderTimeWindow.Store(opts.OutOfOrderTimeWindow)
+		headOpts.OutOfOrderCapMax.Store(opts.OutOfOrderCapMax)
+		headOpts.PostingsForMatchersCacheTTL = opts.HeadPostingsForMatchersCacheTTL
+		headOpts.PostingsForMatchersCacheMaxItems = opts.HeadPostingsForMatchersCacheMaxItems
+		headOpts.PostingsForMatchersCacheMaxBytes = opts.HeadPostingsForMatchersCacheMaxBytes
+		headOpts.PostingsForMatchersCacheForce = opts.HeadPostingsForMatchersCacheForce
+		headOpts.SecondaryHashFunction = opts.SecondaryHashFunction
+		if opts.WALReplayConcurrency > 0 {
+			headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
+		}
+		if opts.IsolationDisabled {
+			headOpts.IsolationDisabled = opts.IsolationDisabled
+		}
+		db.head, err = NewHead(r, l, wal, wbl, headOpts, stats.Head)
+		if err != nil {
+			return nil, err
+		}
 	}
 	db.head.SetWriteNotified(db.writeNotified)
 
@@ -965,8 +1011,14 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 
 	if initErr := db.head.Init(minValidTime); initErr != nil {
 		db.head.IncrementWALCorruptionsTotal()
+		if wal == nil {
+			return nil, errors.Wrap(initErr, "initialize custom head")
+		}
 		e, ok := initErr.(*errLoadWbl)
 		if ok {
+			if wbl == nil {
+				return nil, errors.Wrap(initErr, "initialize WBL")
+			}
 			level.Warn(db.logger).Log("msg", "Encountered WBL read error, attempting repair", "err", initErr)
 			if err := wbl.Repair(e.err); err != nil {
 				return nil, errors.Wrap(err, "repair corrupted WBL")
@@ -1051,8 +1103,8 @@ func (db *DB) run(ctx context.Context) {
 			case db.compactc <- struct{}{}:
 			default:
 			}
-		// We attempt mmapping of head chunks regularly.
-		db.head.MmapHeadChunks()
+			// We attempt mmapping of head chunks regularly.
+			db.head.MmapHeadChunks()
 		case <-db.compactc:
 			db.metrics.compactionsTriggered.Inc()
 
@@ -1198,6 +1250,42 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 	}()
 
 	start := time.Now()
+
+	// Give the HeadLike implementation a chance to perform its own head
+	// compaction. Write-only heads (e.g. litehead) flush their in-memory
+	// data to on-disk blocks themselves and return handled=true; in that
+	// case we must NOT run the standard RangeBlockReader + compactor.Write
+	// loop below (RangeBlockReader would return nil and panic).
+	//
+	// The standard Head returns (false, nil) here, preserving the original
+	// behaviour.
+	handled, err := db.head.SelfCompact(ctx)
+	if err != nil {
+		return errors.Wrap(err, "self compact head")
+	}
+	if handled {
+		// The head took care of compaction + WAL truncation internally.
+		// We still need to reload on-disk blocks so retention / block-level
+		// compaction sees the newly written blocks.
+		//
+		// Note: lastBlockMaxt stays math.MinInt64, which makes the defer
+		// TruncateWAL(lastBlockMaxt) a no-op — litehead's truncateWAL
+		// short-circuits on stale mint, and the standard Head never reaches
+		// this branch.
+		if err := db.reloadBlocks(); err != nil {
+			return errors.Wrap(err, "reloadBlocks after self compact head")
+		}
+		compactionDuration := time.Since(start)
+		if compactionDuration.Milliseconds() > db.head.ChunkRange() {
+			level.Warn(db.logger).Log(
+				"msg", "Head compaction took longer than the block time range, compactions are falling behind and won't be able to catch up",
+				"duration", compactionDuration.String(),
+				"block_range", db.head.ChunkRange(),
+			)
+		}
+		return db.compactBlocks()
+	}
+
 	// Check whether we have pending head blocks that are ready to be persisted.
 	// They have the highest priority.
 	for {
@@ -1259,8 +1347,8 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 	return db.compactBlocks()
 }
 
-// CompactHead compacts the given RangeHead.
-func (db *DB) CompactHead(head *RangeHead) error {
+// CompactHead compacts the given BlockReader (typically a RangeHead or similar).
+func (db *DB) CompactHead(head BlockReader) error {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
@@ -1268,7 +1356,8 @@ func (db *DB) CompactHead(head *RangeHead) error {
 		return errors.Wrap(err, "compact head")
 	}
 
-	if err := db.head.TruncateWAL(head.BlockMaxTime()); err != nil {
+	// BlockMaxTime = Meta().MaxTime + 1 (block intervals are half-open: [MinTime, MaxTime))
+	if err := db.head.TruncateWAL(head.Meta().MaxTime + 1); err != nil {
 		return errors.Wrap(err, "WAL truncation")
 	}
 	return nil

@@ -58,6 +58,24 @@ type HeadLike interface {
 	// IsCompactable returns whether the head has a compactable range.
 	IsCompactable() bool
 
+	// SelfCompact lets a HeadLike implementation compact its own head data
+	// internally, bypassing the DB-level RangeBlockReader + compactor.Write
+	// pipeline used by the standard Head.
+	//
+	// Semantics:
+	//   - If the implementation performed (or declined to perform) head
+	//     compaction on its own, it MUST return handled=true. In that case
+	//     the DB will skip its standard head-compact loop and proceed to
+	//     reload/compact blocks on disk.
+	//   - If the implementation wants the DB to drive head compaction
+	//     through the standard path (RangeBlockReader + compactor.Write),
+	//     it MUST return handled=false.
+	//
+	// The standard Head returns (false, nil). Write-only implementations
+	// like litehead return (true, nil) after flushing all in-memory data
+	// to blocks and truncating the WAL.
+	SelfCompact(ctx context.Context) (handled bool, err error)
+
 	// ChunkRange returns the configured chunk time range in milliseconds.
 	ChunkRange() int64
 

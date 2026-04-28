@@ -10,22 +10,72 @@ import (
 // labelCatalog 将 series 的 labels 编码为紧凑的 arena + symbolTable 两级结构。
 // symbolTable 做字符串去重，arena 以 (nameID, valueID) 对存储每条 series 的 labels。
 // append-only：回收仅在 truncate/重建时发生。
+//
+// # 两级 arena 设计（PR-5）
+//
+// 历史实现使用单一 `arena []byte` + `index []uint32`，每次 `sliceLocked()` 都要
+// `make + copy` 一份字节切片，导致 `get/compare/equals` 都带一次分配。这里把
+// arena 拆成一组固定大小的 chunk（`chunks [][]byte`）：
+//
+//   - 每次 `put` 先看当前活跃 chunk 剩余空间是否够本次编码；不够就新建一个 chunk。
+//   - 对于长度 > labelCatalogChunkSize 的超大记录，不做切分，直接为它单独开
+//     一个精确尺寸的 chunk（oversized chunk）。这样解码方始终能在**同一 chunk
+//     内**拿到完整字节，`sliceLocked()` 可以直接返回 sub-slice，不再复制。
+//   - 旧 chunk 一旦分配就不会被 append；只有当前活跃 chunk（`chunks` 的最后一个）
+//     的长度会继续增长。`[]byte` 的 sub-slice 在容量不触发 grow 的前提下稳定，
+//     因此活跃 chunk 的 slice-header 一旦确定就安全（见下文并发正确性说明）。
+//
+// # 并发正确性
+//
+//   - 所有对 `chunks / chunkOffsets / chunkIDs / lengths` 的**写**均在 `lc.mu`
+//     写锁下；所有读在读锁下。
+//   - 活跃 chunk 会在写路径中被 `append` 扩容，必要时底层数组会被替换为新
+//     的更大数组。但在新 chunk 被创建之前，写路径会预先估算剩余容量并决定
+//     是否滚动到下一 chunk；我们为活跃 chunk **预留好 cap = labelCatalogChunkSize**，
+//     保证单条 put 在未触发滚动前不会 grow，因此旧读者手中的 sub-slice 指向
+//     的底层数组永远不会被替换。
+//   - 上述约束是整个方案的安全边界，**不要**改成"按需扩容 cap"。
 type labelCatalog struct {
 	mu sync.RWMutex
 
-	arena []byte
-	// index[labelsID] = arena 中的起始 offset。
-	index []uint32
+	// chunks 是两级 arena 的第二级，每个元素是一块固定容量的字节块。
+	// chunks[0] 是初始 chunk，chunks[len-1] 是当前活跃 chunk（允许 append）。
+	chunks [][]byte
+
+	// chunkIDs[labelsID] 指向该条编码所在的 chunk 下标。
+	chunkIDs []uint32
+	// chunkOffsets[labelsID] 指向该条编码在 chunk 内的起始偏移。
+	chunkOffsets []uint32
+	// lengths[labelsID] 为编码字节数；与 chunk 内下一条目的起始是一致的，
+	// 但显式保存长度可以避免依赖"下一条"，尤其在 oversized / 跨 chunk 情况下更稳。
+	lengths []uint32
 
 	syms symbolTable
 }
 
+// labelCatalogInitialArenaCap 为首个 chunk 预留的容量。保留这个名字以便外部如果
+// 参考到的话能平滑过渡。
 const labelCatalogInitialArenaCap = 1 << 20
+
+// labelCatalogChunkSize 是普通 chunk 的固定容量（1 MiB）。put 时若当前活跃
+// chunk 剩余空间不足以容纳一条编码，则滚动到下一 chunk；若单条编码 > chunkSize，
+// 则为这条编码单独分配一个 oversized chunk。
+//
+// 取值权衡：
+//   - 太小：频繁滚动，chunks 切片本身变长，index 元数据增多
+//   - 太大：一次性预分配的 cap 大，内存常驻抬高；而且 oversized 阈值也变大，极端
+//     长 labels 仍会独占整块
+//
+// 1 MiB 下，一条常规 labels（几十到几百字节）可容纳 ~数千条，保持较低的滚动成本。
+const labelCatalogChunkSize = 1 << 20
 
 func newLabelCatalog() *labelCatalog {
 	lc := &labelCatalog{
-		arena: make([]byte, 0, labelCatalogInitialArenaCap),
-		index: make([]uint32, 0, 1024),
+		// 预分配第一个 chunk，容量等于 labelCatalogInitialArenaCap（与历史语义一致）。
+		chunks:       [][]byte{make([]byte, 0, labelCatalogInitialArenaCap)},
+		chunkIDs:     make([]uint32, 0, 1024),
+		chunkOffsets: make([]uint32, 0, 1024),
+		lengths:      make([]uint32, 0, 1024),
 	}
 	lc.syms.init()
 	return lc
@@ -39,14 +89,58 @@ func (lc *labelCatalog) put(lset labels.Labels) uint32 {
 		buf.PutUvarint32(lc.syms.intern(l.Name))
 		buf.PutUvarint32(lc.syms.intern(l.Value))
 	})
+	encoded := buf.Get()
+	encLen := uint32(len(encoded))
 
 	lc.mu.Lock()
-	offset := uint32(len(lc.arena))
-	lc.arena = append(lc.arena, buf.Get()...)
-	id := uint32(len(lc.index))
-	lc.index = append(lc.index, offset)
-	lc.mu.Unlock()
+	defer lc.mu.Unlock()
+
+	chunkID, offset := lc.reserveLocked(encLen)
+	// 写入字节并把元信息登记到索引。reserveLocked 已经保证 chunks[chunkID] 的
+	// 剩余 cap 足够容纳 encLen，因此这里的 append 不会触发底层数组替换。
+	lc.chunks[chunkID] = append(lc.chunks[chunkID], encoded...)
+
+	id := uint32(len(lc.chunkIDs))
+	lc.chunkIDs = append(lc.chunkIDs, chunkID)
+	lc.chunkOffsets = append(lc.chunkOffsets, offset)
+	lc.lengths = append(lc.lengths, encLen)
 	return id
+}
+
+// reserveLocked 为即将写入的 encLen 字节选择目标 chunk 并返回 (chunkID, offset)。
+// 必须在写锁下调用。
+//
+// 规则：
+//  1. 若活跃 chunk 剩余 cap 足够，直接用活跃 chunk。
+//  2. 否则：
+//     a) 若 encLen > labelCatalogChunkSize，新建一个 **精确长度** 的 oversized
+//     chunk，独占这条记录；随后 append 一个新的空活跃 chunk，保持"最后一个
+//     chunk 是活跃 chunk"的不变式。
+//     b) 否则新建一个标准大小的 chunk 作为新的活跃 chunk。
+func (lc *labelCatalog) reserveLocked(encLen uint32) (chunkID, offset uint32) {
+	active := len(lc.chunks) - 1
+	if remaining := cap(lc.chunks[active]) - len(lc.chunks[active]); uint32(remaining) >= encLen {
+		return uint32(active), uint32(len(lc.chunks[active]))
+	}
+
+	if encLen > labelCatalogChunkSize {
+		// oversized：独占一整块，cap 恰好容纳本条。这条记录一旦写完，所在 chunk
+		// 的剩余空间为 0，以后自然不会被选中继续 append。
+		over := make([]byte, 0, encLen)
+		lc.chunks = append(lc.chunks, over)
+		oversizedID := uint32(len(lc.chunks) - 1)
+
+		// 再补一个空的标准活跃 chunk，保证不变式。
+		fresh := make([]byte, 0, labelCatalogChunkSize)
+		lc.chunks = append(lc.chunks, fresh)
+
+		return oversizedID, 0
+	}
+
+	// 常规滚动：开新活跃 chunk。
+	fresh := make([]byte, 0, labelCatalogChunkSize)
+	lc.chunks = append(lc.chunks, fresh)
+	return uint32(len(lc.chunks) - 1), 0
 }
 
 // get 解码并返回 labelsID 对应的 labels。
@@ -103,17 +197,15 @@ func (lc *labelCatalog) compare(a, b uint32) int {
 	return 0
 }
 
+// sliceLocked 返回 labelsID 对应的编码字节。**直接返回 sub-slice，不再复制**
+// （两级 arena 设计的主要收益）。调用方必须持有 lc.mu 的读锁或写锁；且不得
+// 持有返回 slice 超过 lc.mu 的释放点——因为一旦释放锁并发 put 可能追加数据
+// 到同一 chunk，虽然底层数组不会被替换，但语义上 slice 的有效范围仅在锁内。
 func (lc *labelCatalog) sliceLocked(id uint32) []byte {
-	offset := lc.index[id]
-	var end uint32
-	if int(id)+1 < len(lc.index) {
-		end = lc.index[id+1]
-	} else {
-		end = uint32(len(lc.arena))
-	}
-	buf := make([]byte, end-offset)
-	copy(buf, lc.arena[offset:end])
-	return buf
+	chunkID := lc.chunkIDs[id]
+	offset := lc.chunkOffsets[id]
+	length := lc.lengths[id]
+	return lc.chunks[chunkID][offset : offset+length]
 }
 
 func (lc *labelCatalog) equals(id uint32, lset labels.Labels) bool {
@@ -154,16 +246,22 @@ func (lc *labelCatalog) decodeLabels(dec *encoding.Decbuf) labels.Labels {
 	return b.Labels()
 }
 
+// size 返回当前所有 chunk 中已使用字节数的总和。保持与老实现的语义兼容
+// （老实现是单 arena 的 len(arena)）。
 func (lc *labelCatalog) size() int {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
-	return len(lc.arena)
+	total := 0
+	for _, c := range lc.chunks {
+		total += len(c)
+	}
+	return total
 }
 
 func (lc *labelCatalog) count() int {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
-	return len(lc.index)
+	return len(lc.chunkIDs)
 }
 
 func (lc *labelCatalog) symbolsSize() int {
@@ -232,4 +330,20 @@ func (s *symbolTable) bytes() int {
 		n += len(v)
 	}
 	return n
+}
+
+// snapshotList 返回 symbolTable.list 的浅拷贝切片。
+//
+// 用途：flush 阶段构造 block 的 symbols set 时，允许直接基于 symbolTable 的
+// 内容生成 symbol 集合，而不是再遍历所有 series 去 decode labels。
+// 返回的切片是新的底层数组，调用方可以安全地排序/筛选，不会影响内部状态。
+// symbolTable 是 append-only 的，因此 snapshot 对应的字符串一定是 symbols 的
+// 超集——这对 block 生成来说是可接受的：多余的 symbol 只会让 symbols index
+// 略微变大，但不会影响正确性。
+func (s *symbolTable) snapshotList() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, len(s.list))
+	copy(out, s.list)
+	return out
 }

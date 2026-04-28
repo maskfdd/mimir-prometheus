@@ -1,4 +1,5 @@
 package litehead
+
 import (
 	"fmt"
 	"math"
@@ -74,18 +75,24 @@ func (a *appender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v 
 	return storage.SeriesRef(s.ref), nil
 }
 
-// AppendExemplar 不持久化 exemplar，直接忽略。
+// ErrUnsupportedWriteType 表示该写入类型未被 litehead 支持。
+// litehead 当前仅支持 in-order float samples；exemplar/histogram/metadata 写入
+// 都会显式返回该错误，避免调用方误以为写入成功。
+var ErrUnsupportedWriteType = errors.New("litehead: exemplar/histogram/metadata writes are not supported")
+
+// AppendExemplar 不支持 exemplar 写入，显式返回 ErrUnsupportedWriteType。
 func (a *appender) AppendExemplar(storage.SeriesRef, labels.Labels, exemplar.Exemplar) (storage.SeriesRef, error) {
-	return 0, nil
+	return 0, ErrUnsupportedWriteType
 }
 
-// AppendHistogram / UpdateMetadata：占位实现，后续按需补齐。
+// AppendHistogram 不支持 histogram 写入，显式返回 ErrUnsupportedWriteType。
 func (a *appender) AppendHistogram(storage.SeriesRef, labels.Labels, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
-	return 0, nil
+	return 0, ErrUnsupportedWriteType
 }
 
+// UpdateMetadata 不支持 metadata 写入，显式返回 ErrUnsupportedWriteType。
 func (a *appender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
-	return 0, nil
+	return 0, ErrUnsupportedWriteType
 }
 
 // Commit 持久化到 WAL 并更新 lastTs。
@@ -143,7 +150,10 @@ func (a *appender) resolveSeries(ref storage.SeriesRef, lset labels.Labels) (*me
 	}
 
 	// 真正新 series：创建并记录到 pending 里。
-	s := a.head.createSeries(hash, lset)
+	s, err := a.head.createSeries(hash, lset)
+	if err != nil {
+		return nil, err
+	}
 	a.pendingSeries = append(a.pendingSeries, record.RefSeries{
 		Ref:    s.ref,
 		Labels: lset,
@@ -211,7 +221,15 @@ func (a *appender) maybeCutChunk(s *memSeries, t int64, enc chunkenc.Encoding) e
 }
 
 // sealAndSpillLocked 封口当前 open chunk 并写到 ChunkDiskMapper。须持有 s.mu。
-// mmappedChunks 满时会释放 s.mu 触发同步 flushBlocking。
+//
+// sealed chunks 上限采用 "soft watermark + hard limit" 两级策略（PR-4）：
+//   - sealed 数刚好等于 soft 阈值时：仅递增一次 soft flush hit 计数，**不**做 flush；
+//   - sealed 数 >= hard 阈值时：释放 s.mu，同步 flushBlocking 作为兜底；
+//   - 配置由 Options.SoftFlushSealedChunks / Options.ForcedFlushSealedChunks 控制，
+//     default 见 series.go。
+//
+// 设计意图：让 forced flush 从"每次 sealed 满就触发"降级为"极端罕见的兜底路径"，
+// soft 指标成为提前一步的观测信号。
 func (a *appender) sealAndSpillLocked(s *memSeries) error {
 	c := s.openChunk
 	if c == nil || c.NumSamples() == 0 {
@@ -220,36 +238,35 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 		return nil
 	}
 
-	// mmappedChunks 满：释放 s.mu，同步 flush，再重新获取。
-	for s.mmappedChunksCount >= maxMmappedChunksPerSeries {
+	hardLimit := a.head.opts.ForcedFlushSealedChunks
+	softLimit := a.head.opts.SoftFlushSealedChunks
+
+	// 软阈值：只告警，不 flush。只在"刚好跨过"那一次 +1，避免每次 append 都打点。
+	// sealedLen() 此刻是尚未 append 本次 sealed chunk 的数量；+1 即为本次追加后的值。
+	if softLimit > 0 && s.sealedLen()+1 == softLimit {
+		a.head.metrics.mmappedChunksSoftFlushHits.Inc()
+	}
+
+	// 硬上限：释放 s.mu，同步 flush，再重新获取。
+	for s.sealedLen() >= hardLimit {
 		a.head.metrics.mmappedChunksForcedFlush.Inc()
 		// 更新 maxTime 让 flush 覆盖到当前数据。
 		if s.openMaxT != math.MinInt64 {
 			a.head.updateMinMaxTime(s.openMaxT)
 		}
-		for i := uint8(0); i < s.mmappedChunksCount; i++ {
-			a.head.updateMinMaxTime(s.mmappedChunks[i].maxTime)
-		}
+		s.forEachSealed(func(mc mmappedChunk) {
+			a.head.updateMinMaxTime(mc.maxTime)
+		})
 		s.mu.Unlock()
 		err := a.head.flushBlocking()
 		s.mu.Lock()
 		if err != nil {
 			return errors.Wrap(err, "forced flush on mmapped chunks overflow")
 		}
-		// 保底清理：如果 flush 没能完全清空 mmappedChunks，手动清理。
-		if s.mmappedChunksCount >= maxMmappedChunksPerSeries {
+		// 保底清理：如果 flush 没能完全清空 sealed，手动清理。
+		if s.sealedLen() >= hardLimit {
 			flushedMaxt := a.head.MaxTime()
-			n := uint8(0)
-			for i := uint8(0); i < s.mmappedChunksCount; i++ {
-				if s.mmappedChunks[i].maxTime > flushedMaxt {
-					s.mmappedChunks[n] = s.mmappedChunks[i]
-					n++
-				}
-			}
-			for i := n; i < s.mmappedChunksCount; i++ {
-				s.mmappedChunks[i] = mmappedChunk{}
-			}
-			s.mmappedChunksCount = n
+			s.retainSealedAfter(flushedMaxt, nil)
 			break
 		}
 	}
@@ -270,13 +287,12 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 
 	chkRef := a.head.chunkDiskMapper.WriteChunk(s.ref, mint, maxt, c, false, nil)
 
-	s.mmappedChunks[s.mmappedChunksCount] = mmappedChunk{
+	s.appendSealed(mmappedChunk{
 		ref:        chkRef,
 		minTime:    mint,
 		maxTime:    maxt,
 		numSamples: uint16(c.NumSamples()),
-	}
-	s.mmappedChunksCount++
+	})
 	s.openChunk = nil
 	s.openApp = nil
 	a.head.metrics.chunksSealed.Inc()
@@ -333,8 +349,10 @@ func (a *appender) logOnlyPendingSeries() error {
 
 // reset 清理 appender 状态并放回 pool。
 func (a *appender) reset() {
+	head := a.head
 	a.pendingSeries = a.pendingSeries[:0]
 	a.pendingSamples = a.pendingSamples[:0]
 	a.sampleSeries = a.sampleSeries[:0]
-	a.head.appenderPool.Put(a)
+	head.appenderMtx.RUnlock()
+	head.appenderPool.Put(a)
 }

@@ -34,6 +34,13 @@ func (h *Head) IsCompactable() bool {
 	return h.compactable()
 }
 
+// SelfCompact is a no-op for the standard Head: it relies on the DB's
+// RangeBlockReader + compactor.Write pipeline, so it always returns
+// (false, nil) to indicate that the DB should drive head compaction.
+func (h *Head) SelfCompact(_ context.Context) (bool, error) {
+	return false, nil
+}
+
 // TruncateWAL removes old data before mint from the WAL.
 // It wraps the private truncateWAL() method.
 func (h *Head) TruncateWAL(mint int64) error {

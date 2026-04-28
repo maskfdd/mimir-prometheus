@@ -132,8 +132,9 @@ func (h *Head) replayWAL() error {
 // loadWALSegments 解码 reader 中的所有记录，只处理 Series 和 Samples。
 func (h *Head) loadWALSegments(r *wlog.Reader) error {
 	var (
-		dec     record.Decoder
-		lastRef atomic.Uint64
+		dec          record.Decoder
+		lastRef      atomic.Uint64
+		minValidTime = h.minValidTime.Load()
 	)
 	lastRef.Store(h.lastSeriesID.Load())
 
@@ -165,6 +166,9 @@ func (h *Head) loadWALSegments(r *wlog.Reader) error {
 				return &wlog.CorruptionErr{Err: errors.Wrap(err, "decode samples"), Segment: r.Segment(), Offset: r.Offset()}
 			}
 			for _, s := range samples {
+				if s.T < minValidTime {
+					continue
+				}
 				ws := h.refTab.get(s.Ref)
 				if ws == nil {
 					continue

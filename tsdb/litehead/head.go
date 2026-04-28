@@ -64,6 +64,18 @@ type Options struct {
 
 	SamplesPerChunk int
 
+	// ForcedFlushSealedChunks 是单条 series 允许持有的 sealed mmapped chunk 的硬上限。
+	// 触达该值时 Append 路径会同步触发一次 forced flush 作为兜底保护。默认值见
+	// defaultHardMmappedChunksPerSeries——当前取值保证该兜底是罕见事件，正常不应被触发。
+	// 设为 <=0 时自动回落为默认值。
+	ForcedFlushSealedChunks int
+
+	// SoftFlushSealedChunks 是单条 series 的 sealed mmapped chunk 软告警阈值。
+	// 超过该值时不会触发 forced flush，只会递增观测计数器（soft flush hits），
+	// 用于提醒运维方外部 flush 节奏可能跟不上。要求 0 < Soft < ForcedFlush。
+	// 设为 <=0 时自动回落为默认值。
+	SoftFlushSealedChunks int
+
 	EnableMemorySnapshotOnShutdown bool
 
 	WALReplayConcurrency int
@@ -74,6 +86,13 @@ type Options struct {
 	FlushCheckInterval time.Duration
 
 	NoLockfile bool
+
+	// SeriesLifecycleCallback specifies callbacks invoked during a series lifecycle.
+	// PreCreation is called before creating a series (return non-nil error to reject).
+	// PostCreation is called after a series is created.
+	// PostDeletion is called after series are deleted.
+	// If nil, a no-op callback is used.
+	SeriesLifecycleCallback tsdb.SeriesLifecycleCallback
 }
 
 // DefaultOptions 返回默认选项，默认值对齐 tsdb.DefaultHeadOptions()。
@@ -84,6 +103,8 @@ func DefaultOptions() *Options {
 		WALSegmentSize:                 wlog.DefaultSegmentSize,
 		WALCompression:                 wlog.CompressionNone,
 		SamplesPerChunk:                tsdb.DefaultSamplesPerChunk,
+		ForcedFlushSealedChunks:        defaultHardMmappedChunksPerSeries,
+		SoftFlushSealedChunks:          defaultSoftMmappedChunksPerSeries,
 		FlushCheckInterval:             time.Minute,
 		ChunkWriteBufferSize:           chunks.DefaultWriteBufferSize,
 		ChunkWriteQueueSize:            chunks.DefaultWriteQueueSize,
@@ -112,6 +133,25 @@ func (o *Options) validate() *Options {
 	if o.SamplesPerChunk <= 0 {
 		o.SamplesPerChunk = tsdb.DefaultSamplesPerChunk
 	}
+	// forced flush 阈值：hard 必须 >= 2（理论最小可工作值），soft 必须严格小于 hard。
+	// 若用户配置非法（soft >= hard 或其一 <=0），回落为默认。
+	if o.ForcedFlushSealedChunks <= 0 {
+		o.ForcedFlushSealedChunks = defaultHardMmappedChunksPerSeries
+	}
+	if o.ForcedFlushSealedChunks < 2 {
+		o.ForcedFlushSealedChunks = 2
+	}
+	if o.SoftFlushSealedChunks <= 0 {
+		o.SoftFlushSealedChunks = defaultSoftMmappedChunksPerSeries
+	}
+	if o.SoftFlushSealedChunks >= o.ForcedFlushSealedChunks {
+		// soft 必须留出告警余量，否则 soft 事件会与 hard 事件同时触发，
+		// 失去"提前预警"的语义。
+		o.SoftFlushSealedChunks = o.ForcedFlushSealedChunks - 1
+		if o.SoftFlushSealedChunks < 1 {
+			o.SoftFlushSealedChunks = 1
+		}
+	}
 	if o.FlushCheckInterval <= 0 {
 		o.FlushCheckInterval = time.Minute
 	}
@@ -120,6 +160,9 @@ func (o *Options) validate() *Options {
 	}
 	if o.WALReplayConcurrency <= 0 {
 		o.WALReplayConcurrency = runtime.GOMAXPROCS(0)
+	}
+	if o.SeriesLifecycleCallback == nil {
+		o.SeriesLifecycleCallback = noopSeriesLifecycleCallback{}
 	}
 	return o
 }
@@ -134,6 +177,7 @@ type Head struct {
 	minValidTime          atomic.Int64
 	lastWALTruncationTime atomic.Int64
 	lastSeriesID          atomic.Uint64
+	initialized           atomic.Bool
 
 	metrics *headMetrics
 	opts    *Options
@@ -143,6 +187,10 @@ type Head struct {
 	appenderPool sync.Pool
 	seriesPool   sync.Pool
 	bufPool      sync.Pool
+	// snapshotBufPool 复用 blockReader 冻结 open chunk 时需要的 *[]byte。
+	// 生命周期：newBlockReader 拿取 -> 写入 chunkDescriptor.openBytes -> IndexReader
+	// 与 ChunkReader 都 Close 后由 blockReader 归还。
+	snapshotBufPool sync.Pool
 
 	// series 索引。
 	refTab   *refTable
@@ -151,7 +199,12 @@ type Head struct {
 
 	chunkDiskMapper *chunks.ChunkDiskMapper
 
-	flushMtx sync.Mutex
+	seriesCallback tsdb.SeriesLifecycleCallback
+
+	// appenderMtx prevents background self-compaction from snapshotting
+	// uncommitted samples held by active appenders.
+	appenderMtx sync.RWMutex
+	flushMtx    sync.Mutex
 
 	dir    string
 	locker *tsdbutil.DirLocker
@@ -191,6 +244,7 @@ func NewHead(logger log.Logger, reg prometheus.Registerer, dir string, opts *Opt
 		locker:          locker,
 		wal:             w,
 		chunkDiskMapper: cdm,
+		seriesCallback:  opts.SeriesLifecycleCallback,
 
 		refTab:   newRefTable(),
 		hashIdx:  newHashIndex(),
@@ -204,8 +258,16 @@ func NewHead(logger log.Logger, reg prometheus.Registerer, dir string, opts *Opt
 	h.minValidTime.Store(math.MinInt64)
 	h.lastWALTruncationTime.Store(math.MinInt64)
 
+	// 把 forced flush 的 soft/hard 配置暴露到 gauge，让 alerting 无需再硬编码阈值。
+	h.metrics.mmappedChunksHardLimit.Set(float64(opts.ForcedFlushSealedChunks))
+	h.metrics.mmappedChunksSoftLimit.Set(float64(opts.SoftFlushSealedChunks))
+
 	h.seriesPool.New = func() any { return &memSeries{} }
 	h.bufPool.New = func() any { b := make([]byte, 0, 1024); return &b }
+	// snapshotBufPool 为 blockReader 的 open chunk 冻结字节复用 buffer。
+	// 每次 flush 期间可能同时冻结上万条 series 的 open chunk，直接 make 会产生
+	// 大量短命大对象；改为 pool 复用能显著降低 flush 期 heap 峰值与 GC 抖动。
+	h.snapshotBufPool.New = func() any { b := make([]byte, 0, 512); return &b }
 	h.appenderPool.New = func() any {
 		return &appender{
 			head:           h,
@@ -232,6 +294,7 @@ func (h *Head) Init(minValidTime int64) error {
 			return tsdb_errors.NewMulti(errors.Wrap(err, "replay WAL"), errors.Wrap(repairErr, "repair WAL")).Err()
 		}
 	}
+	h.initialized.Store(true)
 	return nil
 }
 
@@ -330,6 +393,7 @@ func (h *Head) StartTime() (int64, error) {
 
 // Appender 返回一个写入 appender。
 func (h *Head) Appender(_ context.Context) storage.Appender {
+	h.appenderMtx.RLock()
 	return h.appenderPool.Get().(storage.Appender)
 }
 
@@ -405,7 +469,12 @@ func (h *Head) PostingsCardinalityStats(_ string, _ int) *index.PostingsStats {
 }
 
 // createSeries 为新 labels 分配 ref 并注册到 refTable / hashIndex。
-func (h *Head) createSeries(hash uint64, lset labels.Labels) *memSeries {
+// 调用前会先调 PreCreation callback，失败则拒绝创建。
+func (h *Head) createSeries(hash uint64, lset labels.Labels) (*memSeries, error) {
+	if err := h.seriesCallback.PreCreation(lset); err != nil {
+		return nil, err
+	}
+
 	labelsID := h.labelCat.put(lset)
 	ref := chunks.HeadSeriesRef(h.lastSeriesID.Inc())
 
@@ -419,7 +488,9 @@ func (h *Head) createSeries(hash uint64, lset labels.Labels) *memSeries {
 	h.hashIdx.put(hash, ref, labelsID)
 	h.numSeries.Inc()
 	h.metrics.seriesActive.Inc()
-	return s
+
+	h.seriesCallback.PostCreation(lset)
+	return s, nil
 }
 
 // rangeForTimestamp 返回按 width 对齐的时间窗上界。
@@ -448,3 +519,10 @@ func (h *Head) updateMinMaxTime(t int64) {
 		}
 	}
 }
+
+// noopSeriesLifecycleCallback is a no-op implementation of tsdb.SeriesLifecycleCallback.
+type noopSeriesLifecycleCallback struct{}
+
+func (noopSeriesLifecycleCallback) PreCreation(labels.Labels) error                     { return nil }
+func (noopSeriesLifecycleCallback) PostCreation(labels.Labels)                          {}
+func (noopSeriesLifecycleCallback) PostDeletion(map[chunks.HeadSeriesRef]labels.Labels) {}

@@ -30,6 +30,16 @@ type headMetrics struct {
 
 	// litehead 特有指标（prometheus_tsdb_litehead_*）
 	mmappedChunksForcedFlush prometheus.Counter
+	// mmappedChunksSoftFlushHits 每次某条 series 的 sealed 数突破软阈值但未触达
+	// 硬上限时 +1。**该指标上升**说明外部 flush 节奏跟不上，但系统仍在安全工作；
+	// 一旦它与 forced flush 指标的比值长期偏低并且绝对值陡升，就是需要调低
+	// FlushCheckInterval 的信号。
+	mmappedChunksSoftFlushHits prometheus.Counter
+	// mmappedChunksHardLimit 是当前 Head 配置的 sealed chunks 硬上限（常量 gauge），
+	// 用于让监控侧把 forced flush 次数与当前阈值对齐，而不是靠预期常量。
+	mmappedChunksHardLimit prometheus.Gauge
+	// mmappedChunksSoftLimit 是当前 Head 配置的 sealed chunks 软告警阈值。
+	mmappedChunksSoftLimit   prometheus.Gauge
 	labelCatalogSize         prometheus.Gauge
 	labelCatalogCount        prometheus.Gauge
 	labelCatalogSymbolsSize  prometheus.Gauge
@@ -115,7 +125,19 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 
 	m.mmappedChunksForcedFlush = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_litehead_mmapped_chunks_forced_flush_total",
-		Help: "Total number of times a series forced a synchronous flush because its mmapped chunks slot was full.",
+		Help: "Total number of times a series forced a synchronous flush because its mmapped chunks slot reached the hard limit. This path is an extreme fallback; a non-zero rate usually indicates Flush() is called too infrequently.",
+	})
+	m.mmappedChunksSoftFlushHits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_litehead_mmapped_chunks_soft_flush_hits_total",
+		Help: "Total number of times a single series crossed the soft sealed-chunks watermark without forcing a flush. Use it as an early warning that Flush() cadence is slower than the series's chunk churn.",
+	})
+	m.mmappedChunksHardLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_litehead_mmapped_chunks_hard_limit",
+		Help: "Configured hard upper bound of sealed mmapped chunks a single series may hold before triggering a forced flush.",
+	})
+	m.mmappedChunksSoftLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_litehead_mmapped_chunks_soft_limit",
+		Help: "Configured soft watermark of sealed mmapped chunks per series. Crossing it only increments soft_flush_hits, never forces a flush.",
 	})
 	m.labelCatalogSize = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_litehead_label_catalog_bytes",
@@ -146,7 +168,9 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 			m.compactionsTriggered, m.compactionsFailed, m.compactionDuration,
 			m.walCorruptionsTotal, m.walReplayDuration, m.walTruncateDuration,
 			m.checkpointCreationTotal, m.checkpointCreationFail,
-			m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
+			m.mmappedChunksForcedFlush, m.mmappedChunksSoftFlushHits,
+			m.mmappedChunksHardLimit, m.mmappedChunksSoftLimit,
+			m.labelCatalogSize, m.labelCatalogCount,
 			m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 			m.snapshotLoadDuration,
 		)
@@ -165,7 +189,9 @@ func (m *headMetrics) unregister() {
 		m.compactionsTriggered, m.compactionsFailed, m.compactionDuration,
 		m.walCorruptionsTotal, m.walReplayDuration, m.walTruncateDuration,
 		m.checkpointCreationTotal, m.checkpointCreationFail,
-		m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
+		m.mmappedChunksForcedFlush, m.mmappedChunksSoftFlushHits,
+		m.mmappedChunksHardLimit, m.mmappedChunksSoftLimit,
+		m.labelCatalogSize, m.labelCatalogCount,
 		m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 		m.snapshotLoadDuration,
 	} {

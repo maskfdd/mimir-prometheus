@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync/atomic"
 
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
@@ -23,6 +24,10 @@ import (
 // 直接喂给 LeveledCompactor.Write。
 //
 // 快照在 newBlockReader 时一次性采集，后续读操作不再回主索引。
+//
+// 生命周期：Index() 和 Chunks() 各自返回的 reader 都持有对 blockReader 的
+// 反向引用；任一 reader Close 时会递减 openReaders 计数，计数归零后
+// 把复用的 open-chunk buffer 归还到 Head 的 snapshotBufPool。
 type blockReader struct {
 	head       *Head
 	mint, maxt int64
@@ -33,6 +38,15 @@ type blockReader struct {
 	symbolSet []string
 
 	refIndex []refIndexEntry // 按 ref 排序，用于二分查找
+
+	// openBufs 保存本次快照从 snapshotBufPool 借来的 *[]byte。
+	// 所有 reader 全部 Close 后才会被归还，避免在 compactor 还在读
+	// openBytes 的时候提前回收导致 use-after-free。
+	openBufs []*[]byte
+	// openReaders 记录尚未 Close 的 IndexReader + ChunkReader 数量。
+	// Index() 和 Chunks() 各 +1，对应的 Close() 各 -1；归零时归还 openBufs。
+	openReaders atomic.Int32
+	released    atomic.Bool
 }
 
 // refIndexEntry 存储 series ref 到 series 切片下标的映射。
@@ -66,12 +80,17 @@ const (
 )
 
 // newBlockReader 采集 series 快照。
+//
+// 注意 openReaders 的初始值是 1，对应 blockReader 自身持有的一次引用。
+// 调用方（flush 路径）在 compactor.Write 返回后必须调用 br.done() 释放这次引用，
+// 否则从 snapshotBufPool 借来的 buffer 不会被归还。
 func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 	r := &blockReader{
 		head: h,
 		mint: mint,
 		maxt: maxt,
 	}
+	r.openReaders.Store(1)
 
 	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
@@ -79,9 +98,9 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 			s.mu.Unlock()
 			return
 		}
-		descs := make([]chunkDescriptor, 0, int(s.mmappedChunksCount)+1)
-		for i := 0; i < int(s.mmappedChunksCount); i++ {
-			mc := s.mmappedChunks[i]
+		descs := make([]chunkDescriptor, 0, s.sealedLen()+1)
+		for i := 0; i < s.sealedLen(); i++ {
+			mc := *s.sealedAt(i)
 			if mc.maxTime < mint || mc.minTime > maxt {
 				continue
 			}
@@ -97,8 +116,19 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 			openMaxT := s.openMaxT
 			if openMaxT >= mint && openMinT <= maxt {
 				b := s.openChunk.Bytes()
-				frozen := make([]byte, len(b))
-				copy(frozen, b)
+				// 从 snapshotBufPool 借出 scratch buffer 来冻结 open chunk 字节。
+				// pool 对象是 *[]byte；我们按需扩容，再把 live bytes copy 进去。
+				// 对应的 *[]byte 统一挂到 r.openBufs，由 reader 全部 Close 后一次性归还。
+				pb := h.snapshotBufPool.Get().(*[]byte)
+				buf := (*pb)
+				if cap(buf) < len(b) {
+					buf = make([]byte, len(b))
+				} else {
+					buf = buf[:len(b)]
+				}
+				copy(buf, b)
+				*pb = buf
+				r.openBufs = append(r.openBufs, pb)
 				// 对齐标准 Head 的对外语义：仍把 open chunk 暴露成"可增长"块。
 				// 真正的字节和编码已经在快照阶段冻结，避免 Chunk() 再回看 live 状态。
 				descs = append(descs, chunkDescriptor{
@@ -106,7 +136,7 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 					maxTime:      math.MaxInt64,
 					kind:         chunkSourceOpen,
 					openEncoding: s.openChunk.Encoding(),
-					openBytes:    frozen,
+					openBytes:    buf,
 				})
 			}
 		}
@@ -139,18 +169,15 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 	})
 
 	// 收集 symbols。
-	symbolSet := make(map[string]struct{}, 256)
-	for _, snap := range r.series {
-		lset := h.labelCat.get(snap.labelsID)
-		lset.Range(func(l labels.Label) {
-			symbolSet[l.Name] = struct{}{}
-			symbolSet[l.Value] = struct{}{}
-		})
-	}
-	r.symbolSet = make([]string, 0, len(symbolSet))
-	for s := range symbolSet {
-		r.symbolSet = append(r.symbolSet, s)
-	}
+	//
+	// 这里直接基于 symbolTable 的内容快照构造 symbolSet，
+	// 而不是再遍历所有 series 去 decode labels：
+	//   - symbolTable 是 append-only 的，所以它一定是本次 flush 所需 symbols 的超集；
+	//   - block 的 symbols index 允许出现未被任何 series 引用的符号——compactor
+	//     只按顺序 emit symbols，不做引用计数；
+	//   - 这样可以在 flush 路径上消除一次全量 labels decode，flush CPU 和
+	//     瞬时内存都会明显下降。
+	r.symbolSet = h.labelCat.syms.snapshotList()
 	slices.Sort(r.symbolSet)
 
 	r.meta = tsdb.BlockMeta{
@@ -176,8 +203,8 @@ func (r *blockReader) lookupRef(ref storage.SeriesRef) (int, bool) {
 // seriesOverlapsWindowLocked 判断 series 在 [mint, maxt] 范围内有没有可读样本。
 // 调用方必须持有 s.mu。
 func seriesOverlapsWindowLocked(s *memSeries, mint, maxt int64) bool {
-	for i := 0; i < int(s.mmappedChunksCount); i++ {
-		mc := s.mmappedChunks[i]
+	for i := 0; i < s.sealedLen(); i++ {
+		mc := *s.sealedAt(i)
 		if mc.maxTime >= mint && mc.minTime <= maxt {
 			return true
 		}
@@ -197,15 +224,46 @@ func (r *blockReader) Meta() tsdb.BlockMeta { return r.meta }
 func (r *blockReader) Size() int64 { return 0 }
 
 func (r *blockReader) Index() (tsdb.IndexReader, error) {
+	r.openReaders.Add(1)
 	return &indexReader{r: r}, nil
 }
 
 func (r *blockReader) Chunks() (tsdb.ChunkReader, error) {
+	r.openReaders.Add(1)
 	return &chunkReader{r: r}, nil
 }
 
 func (r *blockReader) Tombstones() (tombstones.Reader, error) {
 	return tombstones.NewMemTombstones(), nil
+}
+
+// release 递减 openReaders 计数；计数归零后把 openBufs 归还到 Head 的 snapshotBufPool。
+//
+// 这里只 reset slice 长度（保留底层 cap），让 pool 里的下一次请求可以
+// 直接复用已分配的 buffer 容量，避免反复 grow。
+func (r *blockReader) release() {
+	if r.openReaders.Add(-1) > 0 {
+		return
+	}
+	// CAS 保证即使出现多次重复 Close 也只归还一次。
+	if !r.released.CompareAndSwap(false, true) {
+		return
+	}
+	for _, pb := range r.openBufs {
+		if pb == nil {
+			continue
+		}
+		*pb = (*pb)[:0]
+		r.head.snapshotBufPool.Put(pb)
+	}
+	r.openBufs = nil
+}
+
+// done 释放 newBlockReader 初始化时预留的那一次引用。
+// flush 路径在 compactor.Write 返回后必须调用一次，无论成功与否，
+// 以确保 snapshotBufPool 借出的 buffer 最终一定被归还。
+func (r *blockReader) done() {
+	r.release()
 }
 
 // ---------------- IndexReader ----------------
@@ -214,7 +272,10 @@ type indexReader struct {
 	r *blockReader
 }
 
-func (ir *indexReader) Close() error { return nil }
+func (ir *indexReader) Close() error {
+	ir.r.release()
+	return nil
+}
 
 func (ir *indexReader) Symbols() index.StringIter {
 	return index.NewStringListIter(ir.r.symbolSet)
@@ -398,7 +459,10 @@ type chunkReader struct {
 	r *blockReader
 }
 
-func (cr *chunkReader) Close() error { return nil }
+func (cr *chunkReader) Close() error {
+	cr.r.release()
+	return nil
+}
 
 func (cr *chunkReader) Chunk(meta chunks.Meta) (chunkenc.Chunk, error) {
 	sref, cid := chunks.HeadChunkRef(meta.Ref).Unpack()

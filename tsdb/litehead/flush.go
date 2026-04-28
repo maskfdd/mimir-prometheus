@@ -84,6 +84,10 @@ func (h *Head) compactHeadWindowOpts(mint, maxt int64, gcSeries bool) error {
 	h.setMinValidTime(maxt + 1)
 
 	br := newBlockReader(h, mint, maxt)
+	// done() 释放 newBlockReader 保留的引用；无论是 empty-window 快速路径还是
+	// compactor 返回后的正常路径，都必须走到这里，才能把 pool 借出的
+	// open-chunk scratch buffer 归还回去。
+	defer br.done()
 	if len(br.series) == 0 {
 		level.Info(h.logger).Log("msg", "compact head window empty, skipping", "mint", mint, "maxt", maxt)
 		if gcSeries {
@@ -169,22 +173,14 @@ func (h *Head) truncateMmapped(flushMaxt int64) {
 
 	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
-		// 压缩 mmappedChunks：保留 maxTime > flushMaxt 的条目。
-		n := 0
-		for i := 0; i < int(s.mmappedChunksCount); i++ {
-			if s.mmappedChunks[i].maxTime > flushMaxt {
-				s.mmappedChunks[n] = s.mmappedChunks[i]
-				n++
-				if fileNo, _ := s.mmappedChunks[i].ref.Unpack(); uint32(fileNo) < minAliveFileNo {
-					minAliveFileNo = uint32(fileNo)
-				}
+		// 压缩 sealed chunks：保留 maxTime > flushMaxt 的条目，顺带上报
+		// 被保留条目覆盖的最小文件号，用于后续 CDM Truncate。
+		s.retainSealedAfter(flushMaxt, func(mc mmappedChunk) {
+			if fileNo, _ := mc.ref.Unpack(); uint32(fileNo) < minAliveFileNo {
+				minAliveFileNo = uint32(fileNo)
 			}
-		}
-		for i := n; i < int(s.mmappedChunksCount); i++ {
-			s.mmappedChunks[i] = mmappedChunk{}
-		}
-		s.mmappedChunksCount = uint8(n)
-		aliveSealed += n
+		})
+		aliveSealed += s.sealedLen()
 
 		// open chunk：如果所有样本都已经进了本次 flush 的 block，释放掉。
 		// 跨越 flushMaxt 的 open chunk 保留——它里面还有未 flush 的样本。
@@ -222,7 +218,7 @@ func (h *Head) sweepDeadSeries(flushMaxt int64) {
 
 	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
-		dead := s.openChunk == nil && s.mmappedChunksCount == 0 && s.lastTs <= flushMaxt
+		dead := s.openChunk == nil && s.sealedLen() == 0 && s.lastTs <= flushMaxt
 		if dead {
 			deadRefs = append(deadRefs, s.ref)
 			deadLabelsIDs = append(deadLabelsIDs, s.labelsID)
