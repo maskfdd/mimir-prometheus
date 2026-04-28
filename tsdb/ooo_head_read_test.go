@@ -484,7 +484,7 @@ func TestOOOHeadChunkReader_Chunk(t *testing.T) {
 	t.Run("Getting a non existing chunk fails with not found error", func(t *testing.T) {
 		db := newTestDBWithOpts(t, opts)
 
-		cr := NewOOOHeadChunkReader(db.head, 0, 1000)
+		cr := NewOOOHeadChunkReader(db.head.(*Head), 0, 1000)
 		c, err := cr.Chunk(chunks.Meta{
 			Ref: 0x1000000, Chunk: chunkenc.Chunk(nil), MinTime: 100, MaxTime: 300,
 		})
@@ -842,14 +842,14 @@ func TestOOOHeadChunkReader_Chunk(t *testing.T) {
 
 			// The Series method is the one that populates the chunk meta OOO
 			// markers like OOOLastRef. These are then used by the ChunkReader.
-			ir := NewOOOHeadIndexReader(db.head, tc.queryMinT, tc.queryMaxT)
+			ir := NewOOOHeadIndexReader(db.head.(*Head), tc.queryMinT, tc.queryMaxT)
 			var chks []chunks.Meta
 			var b labels.ScratchBuilder
 			err := ir.Series(s1Ref, &b, &chks)
 			require.NoError(t, err)
 			require.Equal(t, len(tc.expChunksSamples), len(chks))
 
-			cr := NewOOOHeadChunkReader(db.head, tc.queryMinT, tc.queryMaxT)
+			cr := NewOOOHeadChunkReader(db.head.(*Head), tc.queryMinT, tc.queryMaxT)
 			for i := 0; i < len(chks); i++ {
 				c, err := cr.Chunk(chks[i])
 				require.NoError(t, err)
@@ -1005,7 +1005,7 @@ func TestOOOHeadChunkReader_Chunk_ConsistentQueryResponseDespiteOfHeadExpanding(
 
 			// The Series method is the one that populates the chunk meta OOO
 			// markers like OOOLastRef. These are then used by the ChunkReader.
-			ir := NewOOOHeadIndexReader(db.head, tc.queryMinT, tc.queryMaxT)
+			ir := NewOOOHeadIndexReader(db.head.(*Head), tc.queryMinT, tc.queryMaxT)
 			var chks []chunks.Meta
 			var b labels.ScratchBuilder
 			err := ir.Series(s1Ref, &b, &chks)
@@ -1020,7 +1020,7 @@ func TestOOOHeadChunkReader_Chunk_ConsistentQueryResponseDespiteOfHeadExpanding(
 			}
 			require.NoError(t, app.Commit())
 
-			cr := NewOOOHeadChunkReader(db.head, tc.queryMinT, tc.queryMaxT)
+			cr := NewOOOHeadChunkReader(db.head.(*Head), tc.queryMinT, tc.queryMaxT)
 			for i := 0; i < len(chks); i++ {
 				c, err := cr.Chunk(chks[i])
 				require.NoError(t, err)

@@ -2657,7 +2657,7 @@ func TestQuerierIndexQueriesRace(t *testing.T) {
 		c := c
 		t.Run(fmt.Sprintf("%v", c.matchers), func(t *testing.T) {
 			db := openTestDB(t, DefaultOptions(), nil)
-			h := db.Head()
+			h := db.Head().(*Head)
 			t.Cleanup(func() {
 				require.NoError(t, db.Close())
 			})

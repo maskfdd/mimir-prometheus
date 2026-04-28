@@ -22,6 +22,7 @@ type headMetrics struct {
 	compactionDuration   prometheus.Summary
 
 	// WAL / checkpoint 指标
+	walCorruptionsTotal     prometheus.Counter
 	walReplayDuration       prometheus.Gauge
 	walTruncateDuration     prometheus.Summary
 	checkpointCreationTotal prometheus.Counter
@@ -89,6 +90,10 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 
 	// ---- prometheus_tsdb_wal_* / prometheus_tsdb_checkpoint_* ----
 
+	m.walCorruptionsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_wal_corruptions_total",
+		Help: "Total number of WAL corruptions.",
+	})
 	m.walReplayDuration = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_data_replay_duration_seconds",
 		Help: "Time taken to replay the data on disk.",
@@ -139,7 +144,7 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 			m.chunksCreated, m.chunksSealed,
 			m.samplesAppended, m.outOfOrderSamples,
 			m.compactionsTriggered, m.compactionsFailed, m.compactionDuration,
-			m.walReplayDuration, m.walTruncateDuration,
+			m.walCorruptionsTotal, m.walReplayDuration, m.walTruncateDuration,
 			m.checkpointCreationTotal, m.checkpointCreationFail,
 			m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
 			m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
@@ -158,7 +163,7 @@ func (m *headMetrics) unregister() {
 		m.chunksCreated, m.chunksSealed,
 		m.samplesAppended, m.outOfOrderSamples,
 		m.compactionsTriggered, m.compactionsFailed, m.compactionDuration,
-		m.walReplayDuration, m.walTruncateDuration,
+		m.walCorruptionsTotal, m.walReplayDuration, m.walTruncateDuration,
 		m.checkpointCreationTotal, m.checkpointCreationFail,
 		m.mmappedChunksForcedFlush, m.labelCatalogSize, m.labelCatalogCount,
 		m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,

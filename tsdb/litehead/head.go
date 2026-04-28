@@ -219,7 +219,9 @@ func NewHead(logger log.Logger, reg prometheus.Registerer, dir string, opts *Opt
 }
 
 // Init 回放 ChunkDiskMapper 和 WAL，恢复 series 状态。
-func (h *Head) Init() error {
+// minValidTime 设置允许写入的最小时间戳下界。
+func (h *Head) Init(minValidTime int64) error {
+	h.setMinValidTime(minValidTime)
 	// 先回放 ChunkDiskMapper，再回放 WAL。
 	if err := h.replayChunkDiskMapper(); err != nil {
 		level.Warn(h.logger).Log("msg", "chunk disk mapper replay returned error", "err", err)

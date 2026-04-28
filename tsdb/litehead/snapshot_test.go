@@ -150,7 +150,7 @@ func TestSnapshotWriteAndLoad(t *testing.T) {
 	opts.EnableMemorySnapshotOnShutdown = true
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 	t.Cleanup(func() { _ = h2.Close() })
 
 	// 验证 series 通过 snapshot 恢复。
@@ -205,7 +205,7 @@ func TestSnapshotWithMultipleSeries(t *testing.T) {
 	opts.EnableMemorySnapshotOnShutdown = true
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 	t.Cleanup(func() { _ = h2.Close() })
 
 	// 验证所有 series 都被恢复。
@@ -234,7 +234,7 @@ func TestSnapshotPlusIncrementalWAL(t *testing.T) {
 
 	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h.Init())
+	require.NoError(t, h.Init(math.MinInt64))
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu")
@@ -249,7 +249,7 @@ func TestSnapshotPlusIncrementalWAL(t *testing.T) {
 	// 阶段 2：重新打开，写更多数据，然后不正常退出（模拟 crash）。
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 
 	app = h2.Appender(ctx)
 	_, err = app.Append(ref, labels.EmptyLabels(), 5000, 5.0)
@@ -265,7 +265,7 @@ func TestSnapshotPlusIncrementalWAL(t *testing.T) {
 	// 增量 WAL 恢复阶段2的 sample。
 	h3, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h3.Init())
+	require.NoError(t, h3.Init(math.MinInt64))
 	t.Cleanup(func() { _ = h3.Close() })
 
 	// series 应该被恢复。
@@ -293,7 +293,7 @@ func TestSnapshotFlushAndReopen(t *testing.T) {
 
 	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h.Init())
+	require.NoError(t, h.Init(math.MinInt64))
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "h1")
@@ -310,7 +310,7 @@ func TestSnapshotFlushAndReopen(t *testing.T) {
 	// 重新打开并写更多数据到第二个 block 窗口。
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 
 	app = h2.Appender(ctx)
 	_, err = app.Append(ref, labels.EmptyLabels(), 70_000, 7.0) // 新窗口
@@ -350,7 +350,7 @@ func TestNoSnapshotFallbackToWALReplay(t *testing.T) {
 
 	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h.Init())
+	require.NoError(t, h.Init(math.MinInt64))
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu")
@@ -368,7 +368,7 @@ func TestNoSnapshotFallbackToWALReplay(t *testing.T) {
 	// 重新打开，应该通过 WAL replay 恢复。
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 	t.Cleanup(func() { _ = h2.Close() })
 
 	appender := h2.Appender(ctx).(*appender)

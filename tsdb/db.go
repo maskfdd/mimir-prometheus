@@ -261,7 +261,7 @@ type DB struct {
 	mtx    sync.RWMutex
 	blocks []*Block
 
-	head *Head
+	head HeadLike
 
 	compactc chan struct{}
 	donec    chan struct{}
@@ -938,7 +938,7 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	if err != nil {
 		return nil, err
 	}
-	db.head.writeNotified = db.writeNotified
+	db.head.SetWriteNotified(db.writeNotified)
 
 	// Register metrics after assigning the head block.
 	db.metrics = newDBMetrics(db, r)
@@ -964,7 +964,7 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	}
 
 	if initErr := db.head.Init(minValidTime); initErr != nil {
-		db.head.metrics.walCorruptionsTotal.Inc()
+		db.head.IncrementWALCorruptionsTotal()
 		e, ok := initErr.(*errLoadWbl)
 		if ok {
 			level.Warn(db.logger).Log("msg", "Encountered WBL read error, attempting repair", "err", initErr)
@@ -1051,8 +1051,8 @@ func (db *DB) run(ctx context.Context) {
 			case db.compactc <- struct{}{}:
 			default:
 			}
-			// We attempt mmapping of head chunks regularly.
-			db.head.mmapHeadChunks()
+		// We attempt mmapping of head chunks regularly.
+		db.head.MmapHeadChunks()
 		case <-db.compactc:
 			db.metrics.compactionsTriggered.Inc()
 
@@ -1109,9 +1109,9 @@ func (db *DB) ApplyConfig(conf *config.Config) error {
 	var wblog *wlog.WL
 	var err error
 	switch {
-	case db.head.wbl != nil:
+	case db.head.WBL() != nil:
 		// The existing WBL from the disk might have been replayed while OOO was disabled.
-		wblog = db.head.wbl
+		wblog = db.head.WBL()
 	case !db.oooWasEnabled.Load() && oooTimeWindow > 0 && db.opts.WALSegmentSize >= 0:
 		segmentSize := wlog.DefaultSegmentSize
 		// Wal is set to a custom size.
@@ -1165,7 +1165,7 @@ func (a dbAppender) Commit() error {
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
-	if a.db.head.compactable() {
+	if a.db.head.IsCompactable() {
 		select {
 		case a.db.compactc <- struct{}{}:
 		default:
@@ -1193,7 +1193,7 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 	defer func() {
 		returnErr = tsdb_errors.NewMulti(
 			returnErr,
-			errors.Wrap(db.head.truncateWAL(lastBlockMaxt), "WAL truncation in Compact defer"),
+			errors.Wrap(db.head.TruncateWAL(lastBlockMaxt), "WAL truncation in Compact defer"),
 		).Err()
 	}()
 
@@ -1206,11 +1206,11 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 			return nil
 		default:
 		}
-		if !db.head.compactable() {
+		if !db.head.IsCompactable() {
 			break
 		}
 		mint := db.head.MinTime()
-		maxt := rangeForTimestamp(mint, db.head.chunkRange.Load())
+		maxt := rangeForTimestamp(mint, db.head.ChunkRange())
 
 		// Wrap head into a range that bounds all reads to it.
 		// We remove 1 millisecond from maxt because block
@@ -1219,13 +1219,13 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 		// so in order to make sure that overlaps are evaluated
 		// consistently, we explicitly remove the last value
 		// from the block interval here.
-		rh := NewRangeHeadWithIsolationDisabled(db.head, mint, maxt-1)
+		rh := db.head.RangeBlockReaderWithIsolationDisabled(mint, maxt-1)
 
-		// Compaction runs with isolation disabled, because head.compactable()
+		// Compaction runs with isolation disabled, because head.IsCompactable()
 		// ensures that maxt is more than chunkRange/2 back from now, and
 		// head.appendableMinValidTime() ensures that no new appends can start within the compaction range.
 		// We do need to wait for any overlapping appenders that started previously to finish.
-		db.head.WaitForAppendersOverlapping(rh.MaxTime())
+		db.head.WaitForAppendersOverlapping(maxt - 1)
 
 		if err := db.compactHead(rh); err != nil {
 			return errors.Wrap(err, "compact head")
@@ -1236,16 +1236,16 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 
 	// Clear some disk space before compacting blocks, especially important
 	// when Head compaction happened over a long time range.
-	if err := db.head.truncateWAL(lastBlockMaxt); err != nil {
+	if err := db.head.TruncateWAL(lastBlockMaxt); err != nil {
 		return errors.Wrap(err, "WAL truncation in Compact")
 	}
 
 	compactionDuration := time.Since(start)
-	if compactionDuration.Milliseconds() > db.head.chunkRange.Load() {
+	if compactionDuration.Milliseconds() > db.head.ChunkRange() {
 		level.Warn(db.logger).Log(
 			"msg", "Head compaction took longer than the block time range, compactions are falling behind and won't be able to catch up",
 			"duration", compactionDuration.String(),
-			"block_range", db.head.chunkRange.Load(),
+			"block_range", db.head.ChunkRange(),
 		)
 	}
 
@@ -1268,7 +1268,7 @@ func (db *DB) CompactHead(head *RangeHead) error {
 		return errors.Wrap(err, "compact head")
 	}
 
-	if err := db.head.truncateWAL(head.BlockMaxTime()); err != nil {
+	if err := db.head.TruncateWAL(head.BlockMaxTime()); err != nil {
 		return errors.Wrap(err, "WAL truncation")
 	}
 	return nil
@@ -1286,7 +1286,7 @@ func (db *DB) compactOOOHead(ctx context.Context) error {
 	if !db.oooWasEnabled.Load() {
 		return nil
 	}
-	oooHead, err := NewOOOCompactionHead(ctx, db.head)
+	oooHead, err := db.head.NewOOOCompactionHead(ctx)
 	if err != nil {
 		return errors.Wrap(err, "get ooo compaction head")
 	}
@@ -1307,7 +1307,7 @@ func (db *DB) compactOOOHead(ctx context.Context) error {
 
 	lastWBLFile, minOOOMmapRef := oooHead.LastWBLFile(), oooHead.LastMmapRef()
 	if lastWBLFile != 0 || minOOOMmapRef != 0 {
-		if err := db.head.truncateOOO(lastWBLFile, minOOOMmapRef); err != nil {
+		if err := db.head.TruncateOOO(lastWBLFile, minOOOMmapRef); err != nil {
 			return errors.Wrap(err, "truncate ooo wbl")
 		}
 	}
@@ -1370,10 +1370,14 @@ func (db *DB) compactOOO(dest string, oooHead *OOOCompactionHead) (_ []ulid.ULID
 	return ulids, nil
 }
 
-// compactHead compacts the given RangeHead.
+// compactHead compacts the given BlockReader (typically a RangeHead or similar).
 // The compaction mutex should be held before calling this method.
-func (db *DB) compactHead(head *RangeHead) error {
-	uid, err := db.compactor.Write(db.dir, head, head.MinTime(), head.BlockMaxTime(), nil)
+func (db *DB) compactHead(head BlockReader) error {
+	// Block intervals are half-open: [b.MinTime, b.MaxTime).
+	// So block max time = Meta().MaxTime + 1.
+	meta := head.Meta()
+	blockMaxTime := meta.MaxTime + 1
+	uid, err := db.compactor.Write(db.dir, head, meta.MinTime, blockMaxTime, nil)
 	if err != nil {
 		return errors.Wrap(err, "persist head block")
 	}
@@ -1387,7 +1391,7 @@ func (db *DB) compactHead(head *RangeHead) error {
 		}
 		return errors.Wrap(err, "reloadBlocks blocks")
 	}
-	if err = db.head.truncateMemory(head.BlockMaxTime()); err != nil {
+	if err = db.head.TruncateMemory(blockMaxTime); err != nil {
 		return errors.Wrap(err, "head memory truncate")
 	}
 	return nil
@@ -1847,7 +1851,7 @@ func (db *DB) inOrderBlocksMaxTime() (maxt int64, ok bool) {
 }
 
 // Head returns the databases's head.
-func (db *DB) Head() *Head {
+func (db *DB) Head() HeadLike {
 	return db.head
 }
 
@@ -1896,7 +1900,7 @@ func (db *DB) EnableCompactions() {
 
 // ForceHeadMMap is intended for use only in tests and benchmarks.
 func (db *DB) ForceHeadMMap() {
-	db.head.mmapHeadChunks()
+	db.head.MmapHeadChunks()
 }
 
 // Snapshot writes the current data to the directory. If withHead is set to true it
@@ -1928,7 +1932,7 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 
 	mint := db.head.MinTime()
 	maxt := db.head.MaxTime()
-	head := NewRangeHead(db.head, mint, maxt)
+	head := db.head.RangeBlockReader(mint, maxt)
 	// Add +1 millisecond to block maxt because block intervals are half-open: [b.MinTime, b.MaxTime).
 	// Because of this block intervals are always +1 than the total samples it includes.
 	if _, err := db.compactor.Write(dir, head, mint, maxt+1, nil); err != nil {
@@ -1951,7 +1955,7 @@ func (db *DB) Querier(mint, maxt int64) (storage.Querier, error) {
 	}
 	var inOrderHeadQuerier storage.Querier
 	if maxt >= db.head.MinTime() {
-		rh := NewRangeHead(db.head, mint, maxt)
+		rh := db.head.RangeBlockReader(mint, maxt)
 		var err error
 		inOrderHeadQuerier, err = NewBlockQuerier(rh, mint, maxt)
 		if err != nil {
@@ -1969,7 +1973,7 @@ func (db *DB) Querier(mint, maxt int64) (storage.Querier, error) {
 			inOrderHeadQuerier = nil
 		}
 		if getNew {
-			rh := NewRangeHead(db.head, newMint, maxt)
+			rh := db.head.RangeBlockReader(newMint, maxt)
 			inOrderHeadQuerier, err = NewBlockQuerier(rh, newMint, maxt)
 			if err != nil {
 				return nil, errors.Wrapf(err, "open block querier for head while getting new querier %s", rh)
@@ -1979,7 +1983,7 @@ func (db *DB) Querier(mint, maxt int64) (storage.Querier, error) {
 
 	var outOfOrderHeadQuerier storage.Querier
 	if overlapsClosedInterval(mint, maxt, db.head.MinOOOTime(), db.head.MaxOOOTime()) {
-		rh := NewOOORangeHead(db.head, mint, maxt)
+		rh := db.head.OOORangeBlockReader(mint, maxt)
 		var err error
 		outOfOrderHeadQuerier, err = NewBlockQuerier(rh, mint, maxt)
 		if err != nil {
@@ -2025,7 +2029,7 @@ func (db *DB) blockChunkQuerierForRange(mint, maxt int64) ([]storage.ChunkQuerie
 	}
 	var inOrderHeadQuerier storage.ChunkQuerier
 	if maxt >= db.head.MinTime() {
-		rh := NewRangeHead(db.head, mint, maxt)
+		rh := db.head.RangeBlockReader(mint, maxt)
 		var err error
 		inOrderHeadQuerier, err = NewBlockChunkQuerier(rh, mint, maxt)
 		if err != nil {
@@ -2043,7 +2047,7 @@ func (db *DB) blockChunkQuerierForRange(mint, maxt int64) ([]storage.ChunkQuerie
 			inOrderHeadQuerier = nil
 		}
 		if getNew {
-			rh := NewRangeHead(db.head, newMint, maxt)
+			rh := db.head.RangeBlockReader(newMint, maxt)
 			inOrderHeadQuerier, err = NewBlockChunkQuerier(rh, newMint, maxt)
 			if err != nil {
 				return nil, errors.Wrapf(err, "open querier for head while getting new querier %s", rh)
@@ -2053,7 +2057,7 @@ func (db *DB) blockChunkQuerierForRange(mint, maxt int64) ([]storage.ChunkQuerie
 
 	var outOfOrderHeadQuerier storage.ChunkQuerier
 	if overlapsClosedInterval(mint, maxt, db.head.MinOOOTime(), db.head.MaxOOOTime()) {
-		rh := NewOOORangeHead(db.head, mint, maxt)
+		rh := db.head.OOORangeBlockReader(mint, maxt)
 		var err error
 		outOfOrderHeadQuerier, err = NewBlockChunkQuerier(rh, mint, maxt)
 		if err != nil {
@@ -2105,7 +2109,7 @@ func (db *DB) UnorderedChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, err
 }
 
 func (db *DB) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
-	return db.head.exemplars.ExemplarQuerier(ctx)
+	return db.head.ExemplarQuerier(ctx)
 }
 
 func rangeForTimestamp(t, width int64) (maxt int64) {
@@ -2193,7 +2197,7 @@ func (db *DB) CleanTombstones() (err error) {
 func (db *DB) SetWriteNotified(wn wlog.WriteNotified) {
 	db.writeNotified = wn
 	// It's possible we already created the head struct, so we should also set the WN for that.
-	db.head.writeNotified = wn
+	db.head.SetWriteNotified(wn)
 }
 
 func isBlockDir(fi fs.DirEntry) bool {

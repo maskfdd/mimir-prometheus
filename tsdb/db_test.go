@@ -291,7 +291,7 @@ func TestNoPanicAfterWALCorruption(t *testing.T) {
 		defer func() {
 			require.NoError(t, db.Close())
 		}()
-		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal), "WAL corruption count mismatch")
+		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.walCorruptionsTotal), "WAL corruption count mismatch")
 
 		querier, err := db.Querier(0, maxt)
 		require.NoError(t, err)
@@ -707,7 +707,7 @@ func TestDB_Snapshot_ChunksOutsideOfCompactedRange(t *testing.T) {
 	snap := t.TempDir()
 
 	// Hackingly introduce "race", by having lower max time then maxTime in last chunk.
-	db.head.maxTime.Sub(10)
+	db.head.(*Head).maxTime.Sub(10)
 
 	require.NoError(t, db.Snapshot(snap, true))
 	require.NoError(t, db.Close())
@@ -1127,7 +1127,7 @@ func testWALReplayRaceOnSamplesLoggedBeforeSeries(t *testing.T, numSamplesBefore
 			})
 		}
 
-		err := db.Head().wal.Log(enc.Samples(samples, nil))
+		err := db.Head().(*Head).wal.Log(enc.Samples(samples, nil))
 		require.NoError(t, err)
 
 		// Add samples via appender so that they're logged after the series in the WAL.
@@ -1556,19 +1556,19 @@ func TestSizeRetention(t *testing.T) {
 		}
 	}
 	require.NoError(t, headApp.Commit())
-	db.Head().mmapHeadChunks()
+	db.Head().(*Head).mmapHeadChunks()
 
 	require.Eventually(t, func() bool {
-		return db.Head().chunkDiskMapper.IsQueueEmpty()
+		return db.Head().(*Head).chunkDiskMapper.IsQueueEmpty()
 	}, 2*time.Second, 100*time.Millisecond)
 
 	// Test that registered size matches the actual disk size.
 	require.NoError(t, db.reloadBlocks())                               // Reload the db to register the new db size.
 	require.Equal(t, len(blocks), len(db.Blocks()))                     // Ensure all blocks are registered.
 	blockSize := int64(prom_testutil.ToFloat64(db.metrics.blocksBytes)) // Use the actual internal metrics.
-	walSize, err := db.Head().wal.Size()
+	walSize, err := db.Head().(*Head).wal.Size()
 	require.NoError(t, err)
-	cdmSize, err := db.Head().chunkDiskMapper.Size()
+	cdmSize, err := db.Head().(*Head).chunkDiskMapper.Size()
 	require.NoError(t, err)
 	require.NotZero(t, cdmSize)
 	// Expected size should take into account block size + WAL size + Head
@@ -1579,14 +1579,14 @@ func TestSizeRetention(t *testing.T) {
 	require.Equal(t, expSize, actSize, "registered size doesn't match actual disk size")
 
 	// Create a WAL checkpoint, and compare sizes.
-	first, last, err := wlog.Segments(db.Head().wal.Dir())
+	first, last, err := wlog.Segments(db.Head().(*Head).wal.Dir())
 	require.NoError(t, err)
-	_, err = wlog.Checkpoint(log.NewNopLogger(), db.Head().wal, first, last-1, func(x chunks.HeadSeriesRef) bool { return false }, 0)
+	_, err = wlog.Checkpoint(log.NewNopLogger(), db.Head().(*Head).wal, first, last-1, func(x chunks.HeadSeriesRef) bool { return false }, 0)
 	require.NoError(t, err)
 	blockSize = int64(prom_testutil.ToFloat64(db.metrics.blocksBytes)) // Use the actual internal metrics.
-	walSize, err = db.Head().wal.Size()
+	walSize, err = db.Head().(*Head).wal.Size()
 	require.NoError(t, err)
-	cdmSize, err = db.Head().chunkDiskMapper.Size()
+	cdmSize, err = db.Head().(*Head).chunkDiskMapper.Size()
 	require.NoError(t, err)
 	require.NotZero(t, cdmSize)
 	expSize = blockSize + walSize + cdmSize
@@ -1595,8 +1595,8 @@ func TestSizeRetention(t *testing.T) {
 	require.Equal(t, expSize, actSize, "registered size doesn't match actual disk size")
 
 	// Truncate Chunk Disk Mapper and compare sizes.
-	require.NoError(t, db.Head().chunkDiskMapper.Truncate(900))
-	cdmSize, err = db.Head().chunkDiskMapper.Size()
+	require.NoError(t, db.Head().(*Head).chunkDiskMapper.Truncate(900))
+	cdmSize, err = db.Head().(*Head).chunkDiskMapper.Size()
 	require.NoError(t, err)
 	require.NotZero(t, cdmSize)
 	expSize = blockSize + walSize + cdmSize
@@ -1612,12 +1612,12 @@ func TestSizeRetention(t *testing.T) {
 	}
 	require.NoError(t, headApp.Commit())
 
-	walSize, err = db.Head().wal.Size()
+	walSize, err = db.Head().(*Head).wal.Size()
 	require.NoError(t, err)
-	wblSize, err := db.Head().wbl.Size()
+	wblSize, err := db.Head().(*Head).wbl.Size()
 	require.NoError(t, err)
 	require.NotZero(t, wblSize)
-	cdmSize, err = db.Head().chunkDiskMapper.Size()
+	cdmSize, err = db.Head().(*Head).chunkDiskMapper.Size()
 	require.NoError(t, err)
 	expSize = blockSize + walSize + wblSize + cdmSize
 	actSize, err = fileutil.DirSize(db.Dir())
@@ -1634,9 +1634,9 @@ func TestSizeRetention(t *testing.T) {
 	expBlocks := blocks[1:]
 	actBlocks := db.Blocks()
 	blockSize = int64(prom_testutil.ToFloat64(db.metrics.blocksBytes))
-	walSize, err = db.Head().wal.Size()
+	walSize, err = db.Head().(*Head).wal.Size()
 	require.NoError(t, err)
-	cdmSize, err = db.Head().chunkDiskMapper.Size()
+	cdmSize, err = db.Head().(*Head).chunkDiskMapper.Size()
 	require.NoError(t, err)
 	require.NotZero(t, cdmSize)
 	// Expected size should take into account block size + WAL size + WBL size
@@ -2056,7 +2056,7 @@ func TestInitializeHeadTimestamp(t *testing.T) {
 		require.Equal(t, int64(6000), db.head.MinTime())
 		require.Equal(t, int64(15000), db.head.MaxTime())
 		// Check that old series has been GCed.
-		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.series))
+		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.series))
 	})
 }
 
@@ -2229,7 +2229,7 @@ func TestDB_LabelNames(t *testing.T) {
 		appendSamples(db, 0, 4, tst.sampleLabels1)
 
 		// Testing head.
-		headIndexr, err := db.head.Index()
+		headIndexr, err := db.head.(*Head).Index()
 		require.NoError(t, err)
 		labelNames, err := headIndexr.LabelNames(ctx)
 		require.NoError(t, err)
@@ -3020,7 +3020,7 @@ func TestCompactHead(t *testing.T) {
 	require.NoError(t, app.Commit())
 
 	// Compact the Head to create a new block.
-	require.NoError(t, db.CompactHead(NewRangeHead(db.Head(), 0, int64(maxt)-1)))
+	require.NoError(t, db.CompactHead(NewRangeHead(db.Head().(*Head), 0, int64(maxt)-1)))
 	require.NoError(t, db.Close())
 
 	// Delete everything but the new block and
@@ -3067,7 +3067,7 @@ func TestCompactHeadWithDeletion(t *testing.T) {
 	require.NoError(t, err)
 
 	// This recreates the bug.
-	require.NoError(t, db.CompactHead(NewRangeHead(db.Head(), 0, 100)))
+	require.NoError(t, db.CompactHead(NewRangeHead(db.Head().(*Head), 0, 100)))
 	require.NoError(t, db.Close())
 }
 
@@ -3242,35 +3242,35 @@ func TestOneCheckpointPerCompactCall(t *testing.T) {
 		_, err = app.Append(0, lbls, (blockRange*i)+blockRange/2, rand.Float64())
 		require.NoError(t, err)
 		// Rotate the WAL file so that there is >3 files for checkpoint to happen.
-		_, err = db.head.wal.NextSegment()
+		_, err = db.head.(*Head).wal.NextSegment()
 		require.NoError(t, err)
 	}
 	require.NoError(t, app.Commit())
 
 	// Check the existing WAL files.
-	first, last, err := wlog.Segments(db.head.wal.Dir())
+	first, last, err := wlog.Segments(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 0, first)
 	require.Equal(t, 60, last)
 
-	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.metrics.checkpointCreationTotal))
+	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.checkpointCreationTotal))
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.checkpointCreationTotal))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.checkpointCreationTotal))
 
 	// As the data spans for 59 blocks, 58 go to disk and 1 remains in Head.
 	require.Equal(t, 58, len(db.Blocks()))
 	// Though WAL was truncated only once, head should be truncated after each compaction.
-	require.Equal(t, 58.0, prom_testutil.ToFloat64(db.head.metrics.headTruncateTotal))
+	require.Equal(t, 58.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.headTruncateTotal))
 
 	// The compaction should have only truncated first 2/3 of WAL (while also rotating the files).
-	first, last, err = wlog.Segments(db.head.wal.Dir())
+	first, last, err = wlog.Segments(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 40, first)
 	require.Equal(t, 61, last)
 
 	// The first checkpoint would be for first 2/3rd of WAL, hence till 39.
 	// That should be the last checkpoint.
-	_, cno, err := wlog.LastCheckpoint(db.head.wal.Dir())
+	_, cno, err := wlog.LastCheckpoint(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 39, cno)
 
@@ -3306,27 +3306,27 @@ func TestOneCheckpointPerCompactCall(t *testing.T) {
 	require.Equal(t, newBlockMaxt, db.head.MinTime())
 
 	// Another WAL file was rotated.
-	first, last, err = wlog.Segments(db.head.wal.Dir())
+	first, last, err = wlog.Segments(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 40, first)
 	require.Equal(t, 62, last)
 
-	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.metrics.checkpointCreationTotal))
+	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.checkpointCreationTotal))
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.checkpointCreationTotal))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.checkpointCreationTotal))
 
 	// No new blocks should be created as there was not data in between the new samples and the blocks.
 	require.Equal(t, 59, len(db.Blocks()))
 
 	// The compaction should have only truncated first 2/3 of WAL (while also rotating the files).
-	first, last, err = wlog.Segments(db.head.wal.Dir())
+	first, last, err = wlog.Segments(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 55, first)
 	require.Equal(t, 63, last)
 
 	// The first checkpoint would be for first 2/3rd of WAL, hence till 54.
 	// That should be the last checkpoint.
-	_, cno, err = wlog.LastCheckpoint(db.head.wal.Dir())
+	_, cno, err = wlog.LastCheckpoint(db.head.(*Head).wal.Dir())
 	require.NoError(t, err)
 	require.Equal(t, 54, cno)
 }
@@ -3412,7 +3412,7 @@ func testQuerierShouldNotPanicIfHeadChunkIsTruncatedWhileReadingQueriedChunks(t 
 
 	// Compact the TSDB head for the first time. We expect the head chunks file has been cut.
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.Head().metrics.headTruncateTotal))
+	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.Head().(*Head).metrics.headTruncateTotal))
 
 	// Push more samples for another 1x block duration period.
 	for ; ts < 3*DefaultBlockDuration; ts += interval {
@@ -3457,7 +3457,7 @@ func testQuerierShouldNotPanicIfHeadChunkIsTruncatedWhileReadingQueriedChunks(t 
 
 	// Compact the TSDB head again.
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.Head().metrics.headTruncateTotal))
+	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.Head().(*Head).metrics.headTruncateTotal))
 
 	// At this point we expect 1 head chunk has been deleted.
 
@@ -3548,7 +3548,7 @@ func testChunkQuerierShouldNotPanicIfHeadChunkIsTruncatedWhileReadingQueriedChun
 
 	// Compact the TSDB head for the first time. We expect the head chunks file has been cut.
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.Head().metrics.headTruncateTotal))
+	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.Head().(*Head).metrics.headTruncateTotal))
 
 	// Push more samples for another 1x block duration period.
 	for ; ts < 3*DefaultBlockDuration; ts += interval {
@@ -3591,7 +3591,7 @@ func testChunkQuerierShouldNotPanicIfHeadChunkIsTruncatedWhileReadingQueriedChun
 
 	// Compact the TSDB head again.
 	require.NoError(t, db.Compact(ctx))
-	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.Head().metrics.headTruncateTotal))
+	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.Head().(*Head).metrics.headTruncateTotal))
 
 	// At this point we expect 1 head chunk has been deleted.
 
@@ -4080,10 +4080,10 @@ func TestMetadataAssertInMemoryData(t *testing.T) {
 	updateMetadata(t, app, s3, m3)
 	require.NoError(t, app.Commit())
 
-	series1 := db.head.series.getByHash(s1.Hash(), s1)
-	series2 := db.head.series.getByHash(s2.Hash(), s2)
-	series3 := db.head.series.getByHash(s3.Hash(), s3)
-	series4 := db.head.series.getByHash(s4.Hash(), s4)
+	series1 := db.head.(*Head).series.getByHash(s1.Hash(), s1)
+	series2 := db.head.(*Head).series.getByHash(s2.Hash(), s2)
+	series3 := db.head.(*Head).series.getByHash(s3.Hash(), s3)
+	series4 := db.head.(*Head).series.getByHash(s4.Hash(), s4)
 	require.Equal(t, *series1.meta, m1)
 	require.Equal(t, *series2.meta, m2)
 	require.Equal(t, *series3.meta, m3)
@@ -4101,10 +4101,10 @@ func TestMetadataAssertInMemoryData(t *testing.T) {
 	updateMetadata(t, app, s2, m5)
 	require.NoError(t, app.Commit())
 
-	series1 = db.head.series.getByHash(s1.Hash(), s1)
-	series2 = db.head.series.getByHash(s2.Hash(), s2)
-	series3 = db.head.series.getByHash(s3.Hash(), s3)
-	series4 = db.head.series.getByHash(s4.Hash(), s4)
+	series1 = db.head.(*Head).series.getByHash(s1.Hash(), s1)
+	series2 = db.head.(*Head).series.getByHash(s2.Hash(), s2)
+	series3 = db.head.(*Head).series.getByHash(s3.Hash(), s3)
+	series4 = db.head.(*Head).series.getByHash(s4.Hash(), s4)
 	require.Equal(t, *series1.meta, m1)
 	require.Equal(t, *series2.meta, m5)
 	require.Equal(t, *series3.meta, m3)
@@ -4120,13 +4120,13 @@ func TestMetadataAssertInMemoryData(t *testing.T) {
 		require.NoError(t, reopenDB.Close())
 	})
 
-	_, err = reopenDB.head.wal.Size()
+	_, err = reopenDB.head.(*Head).wal.Size()
 	require.NoError(t, err)
 
-	require.Equal(t, *reopenDB.head.series.getByHash(s1.Hash(), s1).meta, m1)
-	require.Equal(t, *reopenDB.head.series.getByHash(s2.Hash(), s2).meta, m5)
-	require.Equal(t, *reopenDB.head.series.getByHash(s3.Hash(), s3).meta, m3)
-	require.Equal(t, *reopenDB.head.series.getByHash(s4.Hash(), s4).meta, m4)
+	require.Equal(t, *reopenDB.head.(*Head).series.getByHash(s1.Hash(), s1).meta, m1)
+	require.Equal(t, *reopenDB.head.(*Head).series.getByHash(s2.Hash(), s2).meta, m5)
+	require.Equal(t, *reopenDB.head.(*Head).series.getByHash(s3.Hash(), s3).meta, m3)
+	require.Equal(t, *reopenDB.head.(*Head).series.getByHash(s4.Hash(), s4).meta, m4)
 }
 
 // TODO(codesome): test more samples incoming once compaction has started. To verify new samples after the start
@@ -4167,7 +4167,7 @@ func TestOOOCompaction(t *testing.T) {
 
 	// Verify that the in-memory ooo chunk is empty.
 	checkEmptyOOOChunk := func(lbls labels.Labels) {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Nil(t, ms.ooo)
@@ -4209,7 +4209,7 @@ func TestOOOCompaction(t *testing.T) {
 
 	// Verify that the in-memory ooo chunk is not empty.
 	checkNonEmptyOOOChunk := func(lbls labels.Labels) {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Greater(t, ms.ooo.oooHeadChunk.chunk.NumSamples(), 0)
@@ -4222,8 +4222,8 @@ func TestOOOCompaction(t *testing.T) {
 	require.Equal(t, len(db.Blocks()), 0)
 
 	// There is a 0th WBL file.
-	require.NoError(t, db.head.wbl.Sync()) // syncing to make sure wbl is flushed in windows
-	files, err := os.ReadDir(db.head.wbl.Dir())
+	require.NoError(t, db.head.(*Head).wbl.Sync()) // syncing to make sure wbl is flushed in windows
+	files, err := os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	require.Equal(t, "00000000", files[0].Name())
@@ -4240,7 +4240,7 @@ func TestOOOCompaction(t *testing.T) {
 	verifyDBSamples() // Blocks created out of OOO head now.
 
 	// 0th WBL file will be deleted and 1st will be the only present.
-	files, err = os.ReadDir(db.head.wbl.Dir())
+	files, err = os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	require.Equal(t, "00000001", files[0].Name())
@@ -4278,14 +4278,14 @@ func TestOOOCompaction(t *testing.T) {
 	verifySamples(db.Blocks()[2], 240, 310)
 
 	// There should be a single m-map file.
-	mmapDir := mmappedChunksDir(db.head.opts.ChunkDirRoot)
+	mmapDir := mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)
 	files, err = os.ReadDir(mmapDir)
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 
 	// Compact the in-order head and expect another block.
 	// Since this is a forced compaction, this block is not aligned with 2h.
-	err = db.CompactHead(NewRangeHead(db.head, 250*time.Minute.Milliseconds(), 350*time.Minute.Milliseconds()))
+	err = db.CompactHead(NewRangeHead(db.head.(*Head), 250*time.Minute.Milliseconds(), 350*time.Minute.Milliseconds()))
 	require.NoError(t, err)
 	require.Equal(t, len(db.Blocks()), 4) // [0, 120), [120, 240), [240, 360), [250, 351)
 	verifySamples(db.Blocks()[3], 250, 350)
@@ -4350,7 +4350,7 @@ func TestOOOCompactionWithNormalCompaction(t *testing.T) {
 
 	// Checking that ooo chunk is not empty.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Greater(t, ms.ooo.oooHeadChunk.chunk.NumSamples(), 0)
@@ -4378,7 +4378,7 @@ func TestOOOCompactionWithNormalCompaction(t *testing.T) {
 
 	// Checking that ooo chunk is empty.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Nil(t, ms.ooo)
@@ -4451,7 +4451,7 @@ func TestOOOCompactionWithDisabledWriteLog(t *testing.T) {
 
 	// Checking that ooo chunk is not empty.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Greater(t, ms.ooo.oooHeadChunk.chunk.NumSamples(), 0)
@@ -4479,7 +4479,7 @@ func TestOOOCompactionWithDisabledWriteLog(t *testing.T) {
 
 	// Checking that ooo chunk is empty.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Nil(t, ms.ooo)
@@ -4552,7 +4552,7 @@ func TestOOOQueryAfterRestartWithSnapshotAndRemovedWBL(t *testing.T) {
 
 	// Checking that there are some ooo m-map chunks.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Equal(t, 2, len(ms.ooo.oooMmappedChunks))
@@ -4571,7 +4571,7 @@ func TestOOOQueryAfterRestartWithSnapshotAndRemovedWBL(t *testing.T) {
 
 	// Check ooo m-map chunks again.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Equal(t, 2, len(ms.ooo.oooMmappedChunks))
@@ -4611,7 +4611,7 @@ func TestOOOQueryAfterRestartWithSnapshotAndRemovedWBL(t *testing.T) {
 
 	// Checking that ooo chunk is empty in Head.
 	for _, lbls := range []labels.Labels{series1, series2} {
-		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.head.(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Nil(t, ms.ooo)
@@ -4700,7 +4700,7 @@ func Test_Querier_OOOQuery(t *testing.T) {
 			require.NotNil(t, seriesSet[series1.String()])
 			require.Equal(t, 1, len(seriesSet))
 			require.Equal(t, expSamples, seriesSet[series1.String()])
-			require.GreaterOrEqual(t, float64(oooSamples), prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
+			require.GreaterOrEqual(t, float64(oooSamples), prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
 		})
 	}
 }
@@ -4784,7 +4784,7 @@ func Test_ChunkQuerier_OOOQuery(t *testing.T) {
 			chks := queryChunks(t, querier, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar1"))
 			require.NotNil(t, chks[series1.String()])
 			require.Equal(t, 1, len(chks))
-			require.Equal(t, float64(oooSamples), prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
+			require.Equal(t, float64(oooSamples), prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
 			var gotSamples []chunks.Sample
 			for _, chunk := range chks[series1.String()] {
 				it := chunk.Chunk.Iterator(nil)
@@ -4863,7 +4863,7 @@ func TestOOOAppendAndQuery(t *testing.T) {
 			}
 		}
 		require.Equal(t, expSamples, seriesSet)
-		require.Equal(t, float64(totalSamples-2), prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
+		require.Equal(t, float64(totalSamples-2), prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
 	}
 
 	verifyOOOMinMaxTimes := func(expMin, expMax int64) {
@@ -4874,7 +4874,7 @@ func TestOOOAppendAndQuery(t *testing.T) {
 	// In-order samples.
 	addSample(s1, 300, 300, false)
 	addSample(s2, 290, 290, false)
-	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.head.metrics.chunksCreated))
+	require.Equal(t, float64(2), prom_testutil.ToFloat64(db.head.(*Head).metrics.chunksCreated))
 	testQuery(math.MinInt64, math.MaxInt64)
 
 	// Some ooo samples.
@@ -4916,9 +4916,9 @@ func TestOOOAppendAndQuery(t *testing.T) {
 	// Generating some m-map chunks. The m-map chunks here are in such a way
 	// that when sorted w.r.t. mint, the last chunk's maxt is not the overall maxt
 	// of the merged chunk. This tests a bug fixed in https://github.com/grafana/mimir-prometheus/pull/238/.
-	require.Equal(t, float64(4), prom_testutil.ToFloat64(db.head.metrics.chunksCreated))
+	require.Equal(t, float64(4), prom_testutil.ToFloat64(db.head.(*Head).metrics.chunksCreated))
 	addSample(s1, 180, 249, false)
-	require.Equal(t, float64(6), prom_testutil.ToFloat64(db.head.metrics.chunksCreated))
+	require.Equal(t, float64(6), prom_testutil.ToFloat64(db.head.(*Head).metrics.chunksCreated))
 	verifyOOOMinMaxTimes(60, 265)
 	testQuery(math.MinInt64, math.MaxInt64)
 }
@@ -4972,16 +4972,16 @@ func TestOOODisabled(t *testing.T) {
 
 	seriesSet := query(t, querier, labels.MustNewMatcher(labels.MatchRegexp, "foo", "bar."))
 	require.Equal(t, expSamples, seriesSet)
-	require.Equal(t, float64(0), prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
+	require.Equal(t, float64(0), prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamplesAppended), "number of ooo appended samples mismatch")
 	require.Equal(t, float64(failedSamples),
-		prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat))+prom_testutil.ToFloat64(db.head.metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)),
+		prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat))+prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)),
 		"number of ooo/oob samples mismatch")
 
 	// Verifying that no OOO artifacts were generated.
 	_, err = os.ReadDir(path.Join(db.Dir(), wlog.WblDirName))
 	require.True(t, os.IsNotExist(err))
 
-	ms, created, err := db.head.getOrCreate(s1.Hash(), s1)
+	ms, created, err := db.head.(*Head).getOrCreate(s1.Hash(), s1)
 	require.NoError(t, err)
 	require.False(t, created)
 	require.NotNil(t, ms)
@@ -5035,22 +5035,22 @@ func TestWBLAndMmapReplay(t *testing.T) {
 
 	// In-order samples.
 	addSample(s1, 300, 300)
-	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.head.metrics.chunksCreated))
+	require.Equal(t, float64(1), prom_testutil.ToFloat64(db.head.(*Head).metrics.chunksCreated))
 
 	// Some ooo samples.
 	addSample(s1, 250, 260)
 	addSample(s1, 195, 249) // This creates some m-map chunks.
-	require.Equal(t, float64(4), prom_testutil.ToFloat64(db.head.metrics.chunksCreated))
+	require.Equal(t, float64(4), prom_testutil.ToFloat64(db.head.(*Head).metrics.chunksCreated))
 	testQuery(expSamples)
 	oooMint, oooMaxt := minutes(195), minutes(260)
 
 	// Collect the samples only present in the ooo m-map chunks.
-	ms, created, err := db.head.getOrCreate(s1.Hash(), s1)
+	ms, created, err := db.head.(*Head).getOrCreate(s1.Hash(), s1)
 	require.False(t, created)
 	require.NoError(t, err)
 	var s1MmapSamples []chunks.Sample
 	for _, mc := range ms.ooo.oooMmappedChunks {
-		chk, err := db.head.chunkDiskMapper.Chunk(mc.ref)
+		chk, err := db.head.(*Head).chunkDiskMapper.Chunk(mc.ref)
 		require.NoError(t, err)
 		it := chk.Iterator(nil)
 		for it.Next() == chunkenc.ValFloat {
@@ -5063,8 +5063,8 @@ func TestWBLAndMmapReplay(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Making a copy of original state of WBL and Mmap files to use it later.
-	mmapDir := mmappedChunksDir(db.head.opts.ChunkDirRoot)
-	wblDir := db.head.wbl.Dir()
+	mmapDir := mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)
+	wblDir := db.head.(*Head).wbl.Dir()
 	originalWblDir := filepath.Join(t.TempDir(), "original_wbl")
 	originalMmapDir := filepath.Join(t.TempDir(), "original_mmap")
 	require.NoError(t, fileutil.CopyDirs(wblDir, originalWblDir))
@@ -5211,8 +5211,8 @@ func TestOOOCompactionFailure(t *testing.T) {
 
 	// There is a 0th WBL file.
 	verifyFirstWBLFileIs0 := func(count int) {
-		require.NoError(t, db.head.wbl.Sync()) // syncing to make sure wbl is flushed in windows
-		files, err := os.ReadDir(db.head.wbl.Dir())
+		require.NoError(t, db.head.(*Head).wbl.Sync()) // syncing to make sure wbl is flushed in windows
+		files, err := os.ReadDir(db.head.(*Head).wbl.Dir())
 		require.NoError(t, err)
 		require.Len(t, files, count)
 		require.Equal(t, "00000000", files[0].Name())
@@ -5223,7 +5223,7 @@ func TestOOOCompactionFailure(t *testing.T) {
 	verifyFirstWBLFileIs0(1)
 
 	verifyMmapFiles := func(exp ...string) {
-		mmapDir := mmappedChunksDir(db.head.opts.ChunkDirRoot)
+		mmapDir := mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)
 		files, err := os.ReadDir(mmapDir)
 		require.NoError(t, err)
 		require.Len(t, files, len(exp))
@@ -5254,7 +5254,7 @@ func TestOOOCompactionFailure(t *testing.T) {
 	require.Equal(t, len(db.Blocks()), 3)
 
 	// Check that the ooo chunks were removed.
-	ms, created, err := db.head.getOrCreate(series1.Hash(), series1)
+	ms, created, err := db.head.(*Head).getOrCreate(series1.Hash(), series1)
 	require.NoError(t, err)
 	require.False(t, created)
 	require.Nil(t, ms.ooo)
@@ -5270,7 +5270,7 @@ func TestOOOCompactionFailure(t *testing.T) {
 
 	// All but last WBL file will be deleted.
 	// 8 files in total (starting at 0) because of 7 compaction calls.
-	files, err := os.ReadDir(db.head.wbl.Dir())
+	files, err := os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	require.Equal(t, "00000007", files[0].Name())
@@ -5302,7 +5302,7 @@ func TestOOOCompactionFailure(t *testing.T) {
 
 	// Compact the in-order head and expect another block.
 	// Since this is a forced compaction, this block is not aligned with 2h.
-	err = db.CompactHead(NewRangeHead(db.head, 250*time.Minute.Milliseconds(), 350*time.Minute.Milliseconds()))
+	err = db.CompactHead(NewRangeHead(db.head.(*Head), 250*time.Minute.Milliseconds(), 350*time.Minute.Milliseconds()))
 	require.NoError(t, err)
 	require.Equal(t, len(db.Blocks()), 4) // [0, 120), [120, 240), [240, 360), [250, 351)
 	verifySamples(db.Blocks()[3], 250, 350)
@@ -5351,7 +5351,7 @@ func TestWBLCorruption(t *testing.T) {
 	addSamples(120, 130, true)
 
 	// Moving onto the second file.
-	_, err = db.head.wbl.NextSegment()
+	_, err = db.head.(*Head).wbl.NextSegment()
 	require.NoError(t, err)
 
 	// More OOO samples.
@@ -5362,31 +5362,31 @@ func TestWBLCorruption(t *testing.T) {
 	// should be deleted after replay.
 
 	// Checking where we corrupt it.
-	require.NoError(t, db.head.wbl.Sync()) // syncing to make sure wbl is flushed in windows
-	files, err := os.ReadDir(db.head.wbl.Dir())
+	require.NoError(t, db.head.(*Head).wbl.Sync()) // syncing to make sure wbl is flushed in windows
+	files, err := os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 2)
 	f1, err := files[1].Info()
 	require.NoError(t, err)
 	corruptIndex := f1.Size()
-	corruptFilePath := path.Join(db.head.wbl.Dir(), files[1].Name())
+	corruptFilePath := path.Join(db.head.(*Head).wbl.Dir(), files[1].Name())
 
 	// Corrupt the WBL by adding a malformed record.
-	require.NoError(t, db.head.wbl.Log([]byte{byte(record.Samples), 99, 9, 99, 9, 99, 9, 99}))
+	require.NoError(t, db.head.(*Head).wbl.Log([]byte{byte(record.Samples), 99, 9, 99, 9, 99, 9, 99}))
 
 	// More samples after the corruption point.
 	addSamples(260, 280, false)
 	addSamples(290, 300, false)
 
 	// Another file.
-	_, err = db.head.wbl.NextSegment()
+	_, err = db.head.(*Head).wbl.NextSegment()
 	require.NoError(t, err)
 
 	addSamples(310, 320, false)
 
 	// Verifying that we have data after corruption point.
-	require.NoError(t, db.head.wbl.Sync()) // syncing to make sure wbl is flushed in windows
-	files, err = os.ReadDir(db.head.wbl.Dir())
+	require.NoError(t, db.head.(*Head).wbl.Sync()) // syncing to make sure wbl is flushed in windows
+	files, err = os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 3)
 	f1, err = files[1].Info()
@@ -5420,17 +5420,17 @@ func TestWBLCorruption(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// We want everything to be replayed from the WBL. So we delete the m-map files.
-	require.NoError(t, os.RemoveAll(mmappedChunksDir(db.head.opts.ChunkDirRoot)))
+	require.NoError(t, os.RemoveAll(mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)))
 
 	// Restart does the replay and repair.
 	db, err = Open(db.dir, nil, nil, opts, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.walCorruptionsTotal))
 	require.Less(t, len(expAfterRestart), len(allSamples))
 	verifySamples(expAfterRestart)
 
 	// Verify that it did the repair on disk.
-	files, err = os.ReadDir(db.head.wbl.Dir())
+	files, err = os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 3)
 	f0, err = files[0].Info()
@@ -5439,7 +5439,7 @@ func TestWBLCorruption(t *testing.T) {
 	f2, err = files[2].Info()
 	require.NoError(t, err)
 	require.Equal(t, int64(0), f2.Size())
-	require.Equal(t, corruptFilePath, path.Join(db.head.wbl.Dir(), files[1].Name()))
+	require.Equal(t, corruptFilePath, path.Join(db.head.(*Head).wbl.Dir(), files[1].Name()))
 
 	// Verifying that everything after the corruption point is set to 0.
 	b, err := os.ReadFile(corruptFilePath)
@@ -5454,7 +5454,7 @@ func TestWBLCorruption(t *testing.T) {
 	require.NoError(t, db.Close())
 	db, err = Open(db.dir, nil, nil, opts, nil)
 	require.NoError(t, err)
-	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal))
+	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.walCorruptionsTotal))
 	verifySamples(expAfterRestart)
 }
 
@@ -5498,13 +5498,13 @@ func TestOOOMmapCorruption(t *testing.T) {
 	addSamples(120, 120, false)
 
 	// Second m-map file. We will corrupt this file. Sample 120 goes into this new file.
-	require.NoError(t, db.head.chunkDiskMapper.CutNewFile())
+	require.NoError(t, db.head.(*Head).chunkDiskMapper.CutNewFile())
 
 	// More OOO samples.
 	addSamples(200, 230, false)
 	addSamples(240, 255, false)
 
-	require.NoError(t, db.head.chunkDiskMapper.CutNewFile())
+	require.NoError(t, db.head.(*Head).chunkDiskMapper.CutNewFile())
 	addSamples(260, 290, false)
 
 	verifySamples := func(expSamples []chunks.Sample) {
@@ -5526,7 +5526,7 @@ func TestOOOMmapCorruption(t *testing.T) {
 	verifySamples(allSamples)
 
 	// Verifying existing files.
-	mmapDir := mmappedChunksDir(db.head.opts.ChunkDirRoot)
+	mmapDir := mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)
 	files, err := os.ReadDir(mmapDir)
 	require.NoError(t, err)
 	require.Len(t, files, 3)
@@ -5542,14 +5542,14 @@ func TestOOOMmapCorruption(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Moving OOO WBL to use it later.
-	wblDir := db.head.wbl.Dir()
+	wblDir := db.head.(*Head).wbl.Dir()
 	wblDirTmp := path.Join(t.TempDir(), "wbl_tmp")
 	require.NoError(t, os.Rename(wblDir, wblDirTmp))
 
 	// Restart does the replay and repair of m-map files.
 	db, err = Open(db.dir, nil, nil, opts, nil)
 	require.NoError(t, err)
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.mmapChunkCorruptionTotal))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.mmapChunkCorruptionTotal))
 	require.Less(t, len(expInMmapChunks), len(allSamples))
 
 	// Since there is no WBL, only samples from m-map chunks comes in the query.
@@ -5569,7 +5569,7 @@ func TestOOOMmapCorruption(t *testing.T) {
 	require.NoError(t, db.Close())
 	db, err = Open(db.dir, nil, nil, opts, nil)
 	require.NoError(t, err)
-	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.metrics.mmapChunkCorruptionTotal))
+	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.mmapChunkCorruptionTotal))
 	verifySamples(expInMmapChunks)
 
 	// Restart again with the WBL, all samples should be present now.
@@ -5645,7 +5645,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 
 	doOOOCompaction := func(t *testing.T, db *DB) {
 		// WBL is not empty.
-		size, err := db.head.wbl.Size()
+		size, err := db.head.(*Head).wbl.Size()
 		require.NoError(t, err)
 		require.Greater(t, size, int64(0))
 
@@ -5654,7 +5654,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		require.Greater(t, len(db.Blocks()), 0)
 
 		// WBL is empty.
-		size, err = db.head.wbl.Size()
+		size, err = db.head.(*Head).wbl.Size()
 		require.NoError(t, err)
 		require.Equal(t, int64(0), size)
 	}
@@ -5674,7 +5674,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		require.Len(t, s, 0)
 		verifySamples(t, db, allSamples)
 
-		oldWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		oldWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 
 		// Increase time window and try adding again.
 		err := db.ApplyConfig(makeConfig(60))
@@ -5682,7 +5682,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		allSamples = addSamples(t, db, 251, 260, true, allSamples)
 
 		// WBL does not change.
-		newWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		newWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 		require.Equal(t, oldWblPtr, newWblPtr)
 
 		doOOOCompaction(t, db)
@@ -5699,7 +5699,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		// OOO upto 59m old is success.
 		allSamples = addSamples(t, db, 251, 260, true, allSamples)
 
-		oldWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		oldWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 		// Decrease time window.
 		err := db.ApplyConfig(makeConfig(30))
 		require.NoError(t, err)
@@ -5709,7 +5709,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		require.Len(t, s, 0)
 
 		// WBL does not change.
-		newWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		newWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 		require.Equal(t, oldWblPtr, newWblPtr)
 
 		verifySamples(t, db, allSamples)
@@ -5721,7 +5721,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		verifySamples(t, db, allSamples)
 
 		// WBL does not change.
-		newWblPtr = fmt.Sprintf("%p", db.head.wbl)
+		newWblPtr = fmt.Sprintf("%p", db.head.(*Head).wbl)
 		require.Equal(t, oldWblPtr, newWblPtr)
 
 		doOOOCompaction(t, db)
@@ -5740,7 +5740,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		require.Len(t, s, 0)
 		verifySamples(t, db, allSamples)
 
-		require.Nil(t, db.head.wbl)
+		require.Nil(t, db.head.(*Head).wbl)
 
 		// Increase time window and try adding again.
 		err := db.ApplyConfig(makeConfig(60))
@@ -5748,7 +5748,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		allSamples = addSamples(t, db, 251, 260, true, allSamples)
 
 		// WBL gets created.
-		require.NotNil(t, db.head.wbl)
+		require.NotNil(t, db.head.(*Head).wbl)
 
 		verifySamples(t, db, allSamples)
 
@@ -5767,7 +5767,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		// OOO upto 59m old is success.
 		allSamples = addSamples(t, db, 251, 260, true, allSamples)
 
-		oldWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		oldWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 		// Time Window to 0, hence disabled.
 		err := db.ApplyConfig(makeConfig(0))
 		require.NoError(t, err)
@@ -5777,7 +5777,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		require.Len(t, s, 0)
 
 		// WBL does not change and is not removed.
-		newWblPtr := fmt.Sprintf("%p", db.head.wbl)
+		newWblPtr := fmt.Sprintf("%p", db.head.(*Head).wbl)
 		require.Equal(t, oldWblPtr, newWblPtr)
 
 		verifySamples(t, db, allSamples)
@@ -5798,7 +5798,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		s := addSamples(t, db, 290, 309, false, nil)
 		require.Len(t, s, 0)
 		verifySamples(t, db, allSamples)
-		require.Nil(t, db.head.wbl)
+		require.Nil(t, db.head.(*Head).wbl)
 
 		// Time window to 0.
 		err := db.ApplyConfig(makeConfig(0))
@@ -5808,7 +5808,7 @@ func TestOutOfOrderRuntimeConfig(t *testing.T) {
 		s = addSamples(t, db, 290, 309, false, nil)
 		require.Len(t, s, 0)
 		verifySamples(t, db, allSamples)
-		require.Nil(t, db.head.wbl)
+		require.Nil(t, db.head.(*Head).wbl)
 	})
 }
 
@@ -6065,11 +6065,11 @@ func TestDiskFillingUpAfterDisablingOOO(t *testing.T) {
 	require.NoError(t, err)
 	db.DisableCompactions()
 
-	ms := db.head.series.getByHash(series1.Hash(), series1)
+	ms := db.head.(*Head).series.getByHash(series1.Hash(), series1)
 	require.Greater(t, len(ms.ooo.oooMmappedChunks), 0, "OOO mmap chunk was not replayed")
 
 	checkMmapFileContents := func(contains, notContains []string) {
-		mmapDir := mmappedChunksDir(db.head.opts.ChunkDirRoot)
+		mmapDir := mmappedChunksDir(db.head.(*Head).opts.ChunkDirRoot)
 		files, err := os.ReadDir(mmapDir)
 		require.NoError(t, err)
 
@@ -6091,20 +6091,20 @@ func TestDiskFillingUpAfterDisablingOOO(t *testing.T) {
 
 	// Check that m-map files gets deleted properly after compactions.
 
-	db.head.mmapHeadChunks()
+	db.head.(*Head).mmapHeadChunks()
 	checkMmapFileContents([]string{"000001", "000002"}, nil)
 	require.NoError(t, db.Compact(ctx))
 	checkMmapFileContents([]string{"000002"}, []string{"000001"})
 	require.Nil(t, ms.ooo, "OOO mmap chunk was not compacted")
 
 	addSamples(501, 650)
-	db.head.mmapHeadChunks()
+	db.head.(*Head).mmapHeadChunks()
 	checkMmapFileContents([]string{"000002", "000003"}, []string{"000001"})
 	require.NoError(t, db.Compact(ctx))
 	checkMmapFileContents(nil, []string{"000001", "000002", "000003"})
 
 	// Verify that WBL is empty.
-	files, err := os.ReadDir(db.head.wbl.Dir())
+	files, err := os.ReadDir(db.head.(*Head).wbl.Dir())
 	require.NoError(t, err)
 	require.Len(t, files, 1) // Last empty file after compaction.
 	finfo, err := files[0].Info()

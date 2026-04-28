@@ -2,6 +2,7 @@ package litehead
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,7 +29,7 @@ func newTestHead(t *testing.T, opts *Options) (*Head, string) {
 
 	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h.Init())
+	require.NoError(t, h.Init(math.MinInt64))
 	return h, dir
 }
 
@@ -146,7 +147,7 @@ func TestRestartWALReplayRecoversSeries(t *testing.T) {
 	opts.NoLockfile = true
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h2.Init())
+	require.NoError(t, h2.Init(math.MinInt64))
 	t.Cleanup(func() { _ = h2.Close() })
 
 	// 现在用相同 labels 做 GetRef 应该能拿到原来的 ref（或至少 series 已存在）。
@@ -212,7 +213,7 @@ func TestSealedOverflowDoesNotLoseData(t *testing.T) {
 	dir := t.TempDir()
 	h, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 	require.NoError(t, err)
-	require.NoError(t, h.Init())
+	require.NoError(t, h.Init(math.MinInt64))
 
 	ctx := context.Background()
 	lset := labels.FromStrings("__name__", "cpu", "host", "hsealed")
@@ -261,7 +262,7 @@ func TestGCAfterFlushRemovesIdleSeries(t *testing.T) {
 		dir := t.TempDir()
 		d, err := NewHead(log.NewNopLogger(), nil, dir, opts)
 		require.NoError(t, err)
-		require.NoError(t, d.Init())
+		require.NoError(t, d.Init(math.MinInt64))
 		return d, dir
 	}()
 	t.Cleanup(func() { _ = h.Close() })

@@ -2068,7 +2068,7 @@ func TestWalRepair_DecodingError(t *testing.T) {
 					defer func() {
 						require.NoError(t, db.Close())
 					}()
-					require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal))
+					require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.walCorruptionsTotal))
 				}
 
 				// Read the wal content after the repair.
@@ -2144,7 +2144,7 @@ func TestWblRepair_DecodingError(t *testing.T) {
 		defer func() {
 			require.NoError(t, db.Close())
 		}()
-		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.walCorruptionsTotal))
+		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.walCorruptionsTotal))
 	}
 
 	// Read the wbl content after the repair.
@@ -2227,7 +2227,7 @@ func TestHeadReadWriterRepair(t *testing.T) {
 		defer func() {
 			require.NoError(t, db.Close())
 		}()
-		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.mmapChunkCorruptionTotal))
+		require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.mmapChunkCorruptionTotal))
 	}
 
 	// Verify that there are 3 segment files after the repair.
@@ -2603,19 +2603,19 @@ func TestOutOfOrderSamplesMetric(t *testing.T) {
 	require.NoError(t, app.Commit())
 
 	// Test out of order metric.
-	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 0.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 	app = db.Appender(ctx)
 	_, err = app.Append(0, labels.FromStrings("a", "b"), 2, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 
 	_, err = app.Append(0, labels.FromStrings("a", "b"), 3, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 2.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 2.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 
 	_, err = app.Append(0, labels.FromStrings("a", "b"), 4, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 3.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 3.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 	require.NoError(t, app.Commit())
 
 	// Compact Head to test out of bound metric.
@@ -2624,41 +2624,41 @@ func TestOutOfOrderSamplesMetric(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	require.Equal(t, int64(math.MinInt64), db.head.minValidTime.Load())
+	require.Equal(t, int64(math.MinInt64), db.head.(*Head).minValidTime.Load())
 	require.NoError(t, db.Compact(ctx))
-	require.Greater(t, db.head.minValidTime.Load(), int64(0))
+	require.Greater(t, db.head.(*Head).minValidTime.Load(), int64(0))
 
 	app = db.Appender(ctx)
-	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()-2, 99)
+	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()-2, 99)
 	require.Equal(t, storage.ErrOutOfBounds, err)
-	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 1.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)))
 
-	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()-1, 99)
+	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()-1, 99)
 	require.Equal(t, storage.ErrOutOfBounds, err)
-	require.Equal(t, 2.0, prom_testutil.ToFloat64(db.head.metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 2.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeFloat)))
 	require.NoError(t, app.Commit())
 
 	// Some more valid samples for out of order.
 	app = db.Appender(ctx)
 	for i := 1; i <= 5; i++ {
-		_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()+DefaultBlockDuration+int64(i), 99)
+		_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()+DefaultBlockDuration+int64(i), 99)
 		require.NoError(t, err)
 	}
 	require.NoError(t, app.Commit())
 
 	// Test out of order metric.
 	app = db.Appender(ctx)
-	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()+DefaultBlockDuration+2, 99)
+	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()+DefaultBlockDuration+2, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 4.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 4.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 
-	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()+DefaultBlockDuration+3, 99)
+	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()+DefaultBlockDuration+3, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 5.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 5.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 
-	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.minValidTime.Load()+DefaultBlockDuration+4, 99)
+	_, err = app.Append(0, labels.FromStrings("a", "b"), db.head.(*Head).minValidTime.Load()+DefaultBlockDuration+4, 99)
 	require.Equal(t, storage.ErrOutOfOrderSample, err)
-	require.Equal(t, 6.0, prom_testutil.ToFloat64(db.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
+	require.Equal(t, 6.0, prom_testutil.ToFloat64(db.head.(*Head).metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeFloat)))
 	require.NoError(t, app.Commit())
 }
 
@@ -3273,8 +3273,8 @@ func TestIsQuerierCollidingWithTruncation(t *testing.T) {
 	require.NoError(t, app.Commit())
 
 	// This mocks truncation.
-	db.head.memTruncationInProcess.Store(true)
-	db.head.lastMemoryTruncationTime.Store(2000)
+	db.head.(*Head).memTruncationInProcess.Store(true)
+	db.head.(*Head).lastMemoryTruncationTime.Store(2000)
 
 	// Test that IsQuerierValid suggests correct querier ranges.
 	cases := []struct {
@@ -3337,7 +3337,7 @@ func TestWaitForPendingReadersInTimeRange(t *testing.T) {
 			checkWaiting := func(cl io.Closer) {
 				var waitOver atomic.Bool
 				go func() {
-					db.head.WaitForPendingReadersInTimeRange(truncMint, truncMaxt)
+					db.head.(*Head).WaitForPendingReadersInTimeRange(truncMint, truncMaxt)
 					waitOver.Store(true)
 				}()
 				<-time.After(550 * time.Millisecond)
@@ -4350,7 +4350,7 @@ func TestAppendingDifferentEncodingToSameSeries(t *testing.T) {
 
 	var expResult []chunks.Sample
 	checkExpChunks := func(count int) {
-		ms, created, err := db.Head().getOrCreate(lbls.Hash(), lbls)
+		ms, created, err := db.Head().(*Head).getOrCreate(lbls.Hash(), lbls)
 		require.NoError(t, err)
 		require.False(t, created)
 		require.NotNil(t, ms)
