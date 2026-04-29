@@ -252,6 +252,24 @@ type Options struct {
 	// If both UseLiteHead and NewHeadFn are set, NewHeadFn takes precedence.
 	UseLiteHead bool
 
+	// LiteHeadForcedFlushSealedChunks is the hard cap on sealed mmapped chunks
+	// per series for litehead. When reached, the Append path synchronously
+	// triggers a forced flush as a last-resort safety net. Only used when
+	// UseLiteHead is true. If <= 0, the litehead default is used.
+	LiteHeadForcedFlushSealedChunks int
+
+	// LiteHeadSoftFlushSealedChunks is the soft warning threshold on sealed
+	// mmapped chunks per series for litehead. Crossing it increments a soft
+	// flush-hit counter (no forced flush). Only used when UseLiteHead is true.
+	// Must be strictly less than LiteHeadForcedFlushSealedChunks; otherwise
+	// validate() will lower it. If <= 0, the litehead default is used.
+	LiteHeadSoftFlushSealedChunks int
+
+	// LiteHeadFlushCheckInterval controls how often the background periodic
+	// flush loop ticks for litehead. Only used when UseLiteHead is true.
+	// If <= 0, the litehead default is used.
+	LiteHeadFlushCheckInterval time.Duration
+
 	// NewHeadFn, if set, overrides the default Head creation with a custom HeadLike constructor.
 	// This allows injecting an alternative Head implementation (e.g. litehead) without
 	// introducing a circular import from tsdb -> litehead -> tsdb.

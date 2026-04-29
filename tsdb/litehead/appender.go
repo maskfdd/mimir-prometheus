@@ -11,18 +11,62 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
+	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/record"
 )
 
+// errAppender 是一个永远失败的 appender，返回给调用方以在 Head 未 Init 时
+// 安全拒绝写入；所有 Append* 和 UpdateMetadata 都返回预置 err，Commit/Rollback
+// 返回同一 err。注意：调用方按 storage.Appender 契约最终会 Commit 或 Rollback，
+// 这里两者都返回 err 而不 panic，避免调用方崩溃。
+type errAppender struct{ err error }
+
+func (e errAppender) Append(storage.SeriesRef, labels.Labels, int64, float64) (storage.SeriesRef, error) {
+	return 0, e.err
+}
+func (e errAppender) AppendExemplar(storage.SeriesRef, labels.Labels, exemplar.Exemplar) (storage.SeriesRef, error) {
+	return 0, e.err
+}
+func (e errAppender) AppendHistogram(storage.SeriesRef, labels.Labels, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, e.err
+}
+func (e errAppender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, e.err
+}
+func (e errAppender) GetRef(labels.Labels, uint64) (storage.SeriesRef, labels.Labels) {
+	return 0, labels.EmptyLabels()
+}
+func (e errAppender) Commit() error   { return e.err }
+func (e errAppender) Rollback() error { return e.err }
+
 // appender 实现 storage.Appender。
+//
+// 写入语义（A1 修复后）：
+//
+//	Append 只做**只读**乱序预检并把样本放入 pending buffer；
+//	实际写入 open chunk、更新 s.openMaxT / s.lastTs、以及必要的
+//	sealAndSpillLocked 都发生在 Commit 阶段。
+//
+// 这样 Rollback 能真正撤销：pending 样本会被丢弃，memSeries 上的状态
+// 与样本未提交前保持一致。
+//
+// 同一个 appender 内的批内乱序预检（同一 *memSeries 上多次 Append）通过
+// batchSeriesMaxT 维护：它只记本批次内已登记的最大 t，Commit/Rollback
+// 后清空。跨 appender 并发写同一 series 的真实落盘检查，见 Commit 里的
+// "最终防线"分支。
 type appender struct {
 	head *Head
 
 	pendingSeries  []record.RefSeries
 	pendingSamples []record.RefSample
 	sampleSeries   []*memSeries
+
+	// batchSeriesMaxT 记录"本 appender 本批次内对各 *memSeries 已登记过的
+	// 最大 t"。用于 Append 阶段 O(1) 判定批内乱序，避免依赖 s.openMaxT
+	// 所代表的"全局已写入状态"。reset() 时清空并复用 map。
+	batchSeriesMaxT map[*memSeries]int64
 }
 
 // GetRef 查找 labels 对应的 ref。
@@ -45,31 +89,35 @@ func (a *appender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v 
 		return 0, storage.ErrOutOfBounds
 	}
 
+	// 只读预检：读 s.lastTs / s.openMaxT，不修改 series 状态。
+	// 这两个字段只在 Commit 阶段被写入，读侧仍需 s.mu 以配对 Commit 的写。
 	s.mu.Lock()
-	if (s.lastTs != math.MinInt64 && t <= s.lastTs) ||
-		(s.openChunk != nil && s.openChunk.NumSamples() > 0 && t <= s.openMaxT) {
-		s.mu.Unlock()
+	lastTs := s.lastTs
+	openMaxT := s.openMaxT
+	openHasSamples := s.openChunk != nil && s.openChunk.NumSamples() > 0
+	s.mu.Unlock()
+
+	if lastTs != math.MinInt64 && t <= lastTs {
 		a.head.metrics.outOfOrderSamples.Inc()
 		return 0, storage.ErrOutOfOrderSample
 	}
-
-	// open chunk 懒分配；必要时切新 chunk。
-	created := a.ensureOpenChunk(s, t, chunkenc.EncXOR)
-	if created {
-		a.head.metrics.chunksCreated.Inc()
+	if openHasSamples && t <= openMaxT {
+		a.head.metrics.outOfOrderSamples.Inc()
+		return 0, storage.ErrOutOfOrderSample
+	}
+	// 批内乱序预检：同 appender 同 series 上本批次已登记过更晚的 t。
+	if a.batchSeriesMaxT != nil {
+		if prev, ok := a.batchSeriesMaxT[s]; ok && t <= prev {
+			a.head.metrics.outOfOrderSamples.Inc()
+			return 0, storage.ErrOutOfOrderSample
+		}
 	}
 
-	if err := a.maybeCutChunk(s, t, chunkenc.EncXOR); err != nil {
-		s.mu.Unlock()
-		return 0, err
+	// 登记到 pending：真正的 open chunk 写入延后到 Commit。
+	if a.batchSeriesMaxT == nil {
+		a.batchSeriesMaxT = make(map[*memSeries]int64, 64)
 	}
-
-	s.openApp.Append(t, v)
-	if t > s.openMaxT {
-		s.openMaxT = t
-	}
-	s.mu.Unlock()
-
+	a.batchSeriesMaxT[s] = t
 	a.pendingSamples = append(a.pendingSamples, record.RefSample{Ref: s.ref, T: t, V: v})
 	a.sampleSeries = append(a.sampleSeries, s)
 	return storage.SeriesRef(s.ref), nil
@@ -95,33 +143,150 @@ func (a *appender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Met
 	return 0, ErrUnsupportedWriteType
 }
 
-// Commit 持久化到 WAL 并更新 lastTs。
+// Commit 持久化到 WAL 并把 pending 样本真正写入 open chunk / 更新 lastTs。
+//
+// 顺序约束：
+//  1. 获取 appenderMtx.RLock，阻塞 SelfCompact 抢占内存状态；
+//  2. logWAL()：若 WAL 失败，pending 样本不会落到 chunk，也不会更新
+//     series 状态——等价于 Rollback，调用方看到 error 即知未持久化。
+//  3. 按 pending 顺序重放样本到 open chunk。每条样本重新在 s.mu 下走
+//     ensureOpenChunk / maybeCutChunk / openApp.Append，并原子更新
+//     openMaxT / lastTs。
+//
+// 错误处理：commitSample 可能在 forced flush 等路径上返回 IO 错误。
+// 为保持 "WAL 已写 -> 内存状态尽可能同步" 的一致性，循环**不中断**，
+// 把所有 error 聚合为 multi-error 返回。后续重启时 replay 会用 WAL
+// 中的 samples 重新推高各 series 的 lastTs（幂等），不会造成脏 block。
+//
+// 注意：Append 阶段的预检是乐观的（读 s.lastTs / s.openMaxT 不加写锁）。
+// 跨 appender 并发场景下，另一个 appender 可能在本 Commit 执行期间先提交了
+// 更大或等于 t 的样本；此时 Commit 在真写入前要做"最终防线"二次校验，
+// 把乱序样本丢弃并计数，避免 XOR chunk 出现非单调 t 序列。
+// 二次校验失败的样本已经写进了 WAL，但 WAL replay 只更新 lastTs（幂等），
+// 不会产生脏 block。
 func (a *appender) Commit() error {
-	defer a.reset()
+	a.head.appenderMtx.RLock()
+	defer func() {
+		a.head.appenderMtx.RUnlock()
+		a.reset()
+	}()
 
 	if err := a.logWAL(); err != nil {
 		return err
 	}
 
-	for i, s := range a.sampleSeries {
-		sam := a.pendingSamples[i]
-		s.mu.Lock()
-		if sam.T > s.lastTs {
-			s.lastTs = sam.T
+	// 按"连续同 series"分组一次性持锁处理：Mimir push / remote_write 场景里
+	// 同一 appender 常包含同 series 多条样本，逐样本 Lock/Unlock 会在 s.mu
+	// 上产生大量无意义抖动。分组后每组只走一次 Lock/Unlock，其他路径语义
+	// 完全一致（最终防线、ensureOpenChunk / maybeCutChunk、openMaxT/lastTs
+	// 更新、metrics 均逐样本执行）。
+	var errs = tsdb_errors.NewMulti()
+	n := len(a.sampleSeries)
+	i := 0
+	for i < n {
+		// 找到 [i, j) 这段连续同 series。
+		s := a.sampleSeries[i]
+		j := i + 1
+		for j < n && a.sampleSeries[j] == s {
+			j++
 		}
-		s.mu.Unlock()
-		a.head.updateMinMaxTime(sam.T)
-		a.head.metrics.samplesAppended.Inc()
+		if err := a.commitSampleRun(s, a.pendingSamples[i:j]); err != nil {
+			errs.Add(err)
+			// 继续处理后续样本：WAL 是权威来源，内存 state 尽量同步。
+		}
+		i = j
+	}
+	return errs.Err()
+}
+
+// commitSampleRun 在一次 s.mu 持锁区间内处理同一 series 的连续样本。
+// 调用方**不**持 s.mu；内部自取并释放。samples 必须非空且全部属于 s。
+//
+// 语义与之前逐样本的 commitSample 等价：
+//   - 每条样本独立做最终防线校验（t <= s.lastTs / t <= s.openMaxT），失败计数并跳过；
+//   - 每条样本独立走 ensureOpenChunk / maybeCutChunk，因此中途可能跨 chunk 切换；
+//   - maybeCutChunk 触达 hard limit 时会 Unlock/flushBlocking/Lock（原有行为），
+//     本函数通过返回 err 中断当前 run，把错误上交给 Commit 循环聚合；
+//   - samplesAppended 指标按 run 累加后一次性 Add；
+//   - updateMinMaxTime 在 run 内实际落盘的 t 单调递增，只需对"首个落盘 t"
+//     推 minTime、"末尾落盘 t"推 maxTime 各一次，结果与逐样本等价但省掉
+//     N-1 次 CAS loop。
+func (a *appender) commitSampleRun(s *memSeries, samples []record.RefSample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var appended float64
+	var firstOK, lastOK int64
+	firstOK = math.MaxInt64 // 哨兵：尚未有成功样本。
+
+	for _, sam := range samples {
+		t, v := sam.T, sam.V
+
+		// 最终防线：在真写入前再次校验单调性。可能被其它 appender 抢先提交
+		// 更大的 t，或者本 run 之前已处理的样本刚刚推高了 openMaxT/lastTs。
+		if s.lastTs != math.MinInt64 && t <= s.lastTs {
+			a.head.metrics.outOfOrderSamples.Inc()
+			continue
+		}
+		if s.openChunk != nil && s.openChunk.NumSamples() > 0 && t <= s.openMaxT {
+			a.head.metrics.outOfOrderSamples.Inc()
+			continue
+		}
+
+		// open chunk 懒分配；必要时切新 chunk。
+		if a.ensureOpenChunk(s, t, chunkenc.EncXOR) {
+			a.head.metrics.chunksCreated.Inc()
+		}
+		if err := a.maybeCutChunk(s, t, chunkenc.EncXOR); err != nil {
+			// maybeCutChunk 已在内部处理 Unlock/Lock 过渡（flushBlocking 路径），
+			// 返回时 s.mu 仍持有，由外层 defer 释放。
+			// 在返回错误前，把此前已经落盘的样本对应的 metric / minMaxTime 提交。
+			if appended > 0 {
+				a.head.metrics.samplesAppended.Add(appended)
+				a.head.updateMinMaxTime(firstOK)
+				if lastOK != firstOK {
+					a.head.updateMinMaxTime(lastOK)
+				}
+			}
+			return err
+		}
+
+		s.openApp.Append(t, v)
+		if t > s.openMaxT {
+			s.openMaxT = t
+		}
+		if t > s.lastTs {
+			s.lastTs = t
+		}
+
+		if appended == 0 {
+			firstOK = t
+		}
+		lastOK = t
+		appended++
+	}
+
+	if appended > 0 {
+		a.head.metrics.samplesAppended.Add(appended)
+		a.head.updateMinMaxTime(firstOK)
+		if lastOK != firstOK {
+			a.head.updateMinMaxTime(lastOK)
+		}
 	}
 	return nil
 }
 
 // Rollback 丢弃样本，但保留已分配的新 series（须写入 WAL）。
+//
+// 仅当存在 pendingSeries 需要落 WAL 时才获取 appenderMtx.RLock；
+// 纯粹的 "append 失败/放弃" 路径无需阻塞 SelfCompact。
 func (a *appender) Rollback() error {
 	defer a.reset()
 	if len(a.pendingSeries) == 0 {
 		return nil
 	}
+	a.head.appenderMtx.RLock()
+	defer a.head.appenderMtx.RUnlock()
 	return a.logOnlyPendingSeries()
 }
 
@@ -300,32 +465,59 @@ func (a *appender) sealAndSpillLocked(s *memSeries) error {
 }
 
 // logWAL 一次性把 pending 的 series 和 samples 写入 WAL。
+//
+// 性能要点：series 与 samples 两条 record 通过**一次** wal.Log(a, b) 提交，
+// 利用 WL.Log 的 variadic 语义：内部只取一次 mtx、只在最后一条 record 做
+// page flush。等价于老实现"分两次 Log 各 fsync"的对半开销；实测 Commit
+// 热路径可见降低。
+//
+// 实现细节：两条 record 需要各自独立的 []byte，不能复用同一缓冲区，否则
+// 第二次 encode 会覆盖第一次的内容。从 bufPool 拿两块 buf：pool Get/Put
+// 无锁且便宜，足以抵消一次重新分配的风险。
 func (a *appender) logWAL() error {
-	if len(a.pendingSeries) == 0 && len(a.pendingSamples) == 0 {
+	hasSeries := len(a.pendingSeries) > 0
+	hasSamples := len(a.pendingSamples) > 0
+	if !hasSeries && !hasSamples {
 		return nil
 	}
 
 	var enc record.Encoder
-	pbuf := a.head.bufPool.Get().(*[]byte)
-	buf := (*pbuf)[:0]
+
+	var seriesBufPtr, samplesBufPtr *[]byte
+	var seriesBuf, samplesBuf []byte
 	defer func() {
-		*pbuf = buf[:0]
-		a.head.bufPool.Put(pbuf)
+		if seriesBufPtr != nil {
+			*seriesBufPtr = seriesBuf[:0]
+			a.head.bufPool.Put(seriesBufPtr)
+		}
+		if samplesBufPtr != nil {
+			*samplesBufPtr = samplesBuf[:0]
+			a.head.bufPool.Put(samplesBufPtr)
+		}
 	}()
 
-	if len(a.pendingSeries) > 0 {
-		buf = enc.Series(a.pendingSeries, buf)
-		if err := a.head.wal.Log(buf); err != nil {
+	if hasSeries {
+		seriesBufPtr = a.head.bufPool.Get().(*[]byte)
+		seriesBuf = enc.Series(a.pendingSeries, (*seriesBufPtr)[:0])
+	}
+	if hasSamples {
+		samplesBufPtr = a.head.bufPool.Get().(*[]byte)
+		samplesBuf = enc.Samples(a.pendingSamples, (*samplesBufPtr)[:0])
+	}
+
+	switch {
+	case hasSeries && hasSamples:
+		if err := a.head.wal.Log(seriesBuf, samplesBuf); err != nil {
+			return errors.Wrap(err, "log WAL series+samples")
+		}
+	case hasSeries:
+		if err := a.head.wal.Log(seriesBuf); err != nil {
 			return errors.Wrap(err, "log WAL series")
 		}
-		buf = buf[:0]
-	}
-	if len(a.pendingSamples) > 0 {
-		buf = enc.Samples(a.pendingSamples, buf)
-		if err := a.head.wal.Log(buf); err != nil {
+	case hasSamples:
+		if err := a.head.wal.Log(samplesBuf); err != nil {
 			return errors.Wrap(err, "log WAL samples")
 		}
-		buf = buf[:0]
 	}
 	return nil
 }
@@ -348,11 +540,19 @@ func (a *appender) logOnlyPendingSeries() error {
 }
 
 // reset 清理 appender 状态并放回 pool。
+//
+// 注意：本方法**不**释放 appenderMtx.RLock。自 B1 修复起，RLock 不再由
+// Appender() 获取，而是由 Commit/Rollback 在真正落盘/写 WAL 的区间内
+// 细粒度持有。
 func (a *appender) reset() {
 	head := a.head
 	a.pendingSeries = a.pendingSeries[:0]
 	a.pendingSamples = a.pendingSamples[:0]
 	a.sampleSeries = a.sampleSeries[:0]
-	head.appenderMtx.RUnlock()
+	// 清 batchSeriesMaxT 但保留底层 buckets 以便复用。map 没有原生 truncate，
+	// 用 delete 循环；在稳态批量大小（~千条）下成本可接受，远低于每次 make。
+	for k := range a.batchSeriesMaxT {
+		delete(a.batchSeriesMaxT, k)
+	}
 	head.appenderPool.Put(a)
 }

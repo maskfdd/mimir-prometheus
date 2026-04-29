@@ -44,6 +44,12 @@ func newLiteHeadFactory() tsdb.NewHeadFnType {
 			WALReplayConcurrency:           opts.WALReplayConcurrency,
 			NoLockfile:                     true, // DB already handles directory locking.
 			SeriesLifecycleCallback:        opts.SeriesLifecycleCallback,
+
+			// litehead-specific tunables. Options.validate() falls back to
+			// package defaults when any of these are <= 0.
+			ForcedFlushSealedChunks: opts.LiteHeadForcedFlushSealedChunks,
+			SoftFlushSealedChunks:   opts.LiteHeadSoftFlushSealedChunks,
+			FlushCheckInterval:      opts.LiteHeadFlushCheckInterval,
 		}
 		return NewHead(l, r, dir, liteOpts)
 	}

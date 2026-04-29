@@ -391,9 +391,22 @@ func (h *Head) StartTime() (int64, error) {
 	return int64(0), nil
 }
 
+// ErrNotInitialized 表示 Head 还未完成 Init 即被请求 Appender。
+// 调用方应等待 Init 结束后再调 Appender，否则 WAL/CDM replay 未完成，
+// refTab/hashIdx/labelCat 处于不一致状态，新写入会与即将回放的 ref 冲突。
+var ErrNotInitialized = errors.New("litehead: Appender called before Init completed")
+
 // Appender 返回一个写入 appender。
+//
+// 注意：appenderMtx 的 RLock **不**在此处获取，而是在 Commit 真正落盘
+// 阶段细粒度获取（Rollback 若仅写 pendingSeries 也会获取）。这样避免
+// 调用方持有 appender 后未 Commit/Rollback（例如 panic 路径）导致
+// RLock 永远不释放，进而卡死 SelfCompact 的致命死锁。
 func (h *Head) Appender(_ context.Context) storage.Appender {
-	h.appenderMtx.RLock()
+	if !h.initialized.Load() {
+		// 返回一个永远失败的 appender，而不是 panic——调用方可以安全 retry。
+		return errAppender{err: ErrNotInitialized}
+	}
 	return h.appenderPool.Get().(storage.Appender)
 }
 
