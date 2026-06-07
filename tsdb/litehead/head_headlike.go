@@ -64,13 +64,16 @@ func (h *Head) Truncate(mint int64) error {
 // TruncateOOO is a no-op because litehead does not support out-of-order data.
 func (h *Head) TruncateOOO(_ int, _ chunks.ChunkDiskMapperRef) error { return nil }
 
-// SelfCompact flushes all in-memory data to on-disk blocks and truncates the
-// WAL. It always returns handled=true so that DB.Compact() skips the standard
+// SelfCompact flushes complete, BlockDuration-aligned windows of in-memory data
+// to on-disk blocks and truncates the WAL. Incomplete tail windows are kept in
+// memory to avoid generating irregular (shorter-than-BlockDuration) blocks.
+//
+// It always returns handled=true so that DB.Compact() skips the standard
 // RangeBlockReader + compactor.Write head-compact loop (which litehead does
 // not support, because RangeBlockReader returns nil).
 //
 // The ctx is accepted for interface symmetry but not propagated: the
-// underlying tryFlushAll path constructs its own context for the LeveledCompactor.
+// underlying flush path constructs its own context for the LeveledCompactor.
 func (h *Head) SelfCompact(_ context.Context) (bool, error) {
 	h.appenderMtx.Lock()
 	defer h.appenderMtx.Unlock()
@@ -78,7 +81,7 @@ func (h *Head) SelfCompact(_ context.Context) (bool, error) {
 	if !h.compactable() {
 		return true, nil
 	}
-	if err := h.tryFlushAll(); err != nil {
+	if err := h.tryFlushAligned(); err != nil {
 		return true, err
 	}
 	return true, nil

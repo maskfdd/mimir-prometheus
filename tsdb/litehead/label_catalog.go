@@ -400,8 +400,11 @@ func (lc *labelCatalog) rebuild(aliveIDs map[uint32]struct{}) map[uint32]uint32 
 			oldNameID := uint32(dec.Uvarint())
 			oldValueID := uint32(dec.Uvarint())
 			// 查旧 symbolTable 获取字符串。
-			name := lc.syms.lookupLocked(oldNameID)
-			value := lc.syms.lookupLocked(oldValueID)
+			// 使用 lookupNoLock 而非 lookupLocked：调用方已持有 lc.mu.Lock()，
+			// 且 rebuild 在 appenderMtx.Lock 保护下不会有并发 intern，
+			// 因此不需要再取 syms.mu，避免 lc.mu -> syms.mu 的 AB-BA 死锁风险。
+			name := lc.syms.lookupNoLock(oldNameID)
+			value := lc.syms.lookupNoLock(oldValueID)
 			enc.PutUvarint32(newSyms.intern(name))
 			enc.PutUvarint32(newSyms.intern(value))
 		}
@@ -446,10 +449,10 @@ func (lc *labelCatalog) rebuild(aliveIDs map[uint32]struct{}) map[uint32]uint32 
 	return oldToNew
 }
 
-// lookupLocked 在 symbolTable 已持有外部锁时使用（rebuild 内部调用）。
-func (s *symbolTable) lookupLocked(id uint32) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// lookupNoLock 在 symbolTable 的调用方已确保不会有并发写入时使用（rebuild 内部调用）。
+// 不获取 s.mu，避免 lc.mu -> s.mu 的嵌套锁顺序与 put 路径 (s.mu -> lc.mu) 形成死锁。
+// 安全前提：调用方持有 appenderMtx.Lock()，不会有并发 intern。
+func (s *symbolTable) lookupNoLock(id uint32) string {
 	if int(id) >= len(s.list) {
 		return ""
 	}
