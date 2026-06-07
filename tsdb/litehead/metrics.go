@@ -40,6 +40,7 @@ type headMetrics struct {
 	mmappedChunksHardLimit prometheus.Gauge
 	// mmappedChunksSoftLimit 是当前 Head 配置的 sealed chunks 软告警阈值。
 	mmappedChunksSoftLimit   prometheus.Gauge
+	earlyFlushTriggered      prometheus.Counter
 	labelCatalogSize         prometheus.Gauge
 	labelCatalogCount        prometheus.Gauge
 	labelCatalogSymbolsSize  prometheus.Gauge
@@ -139,6 +140,10 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 		Name: "prometheus_tsdb_litehead_mmapped_chunks_soft_limit",
 		Help: "Configured soft watermark of sealed mmapped chunks per series. Crossing it only increments soft_flush_hits, never forces a flush.",
 	})
+	m.earlyFlushTriggered = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_litehead_early_flush_triggered_total",
+		Help: "Total number of times early flush was triggered because active series count exceeded EarlyFlushMinSeries threshold.",
+	})
 	m.labelCatalogSize = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_litehead_label_catalog_bytes",
 		Help: "Approximate size of the lite head labels arena in bytes.",
@@ -170,6 +175,7 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 			m.checkpointCreationTotal, m.checkpointCreationFail,
 			m.mmappedChunksForcedFlush, m.mmappedChunksSoftFlushHits,
 			m.mmappedChunksHardLimit, m.mmappedChunksSoftLimit,
+			m.earlyFlushTriggered,
 			m.labelCatalogSize, m.labelCatalogCount,
 			m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 			m.snapshotLoadDuration,
@@ -191,6 +197,7 @@ func (m *headMetrics) unregister() {
 		m.checkpointCreationTotal, m.checkpointCreationFail,
 		m.mmappedChunksForcedFlush, m.mmappedChunksSoftFlushHits,
 		m.mmappedChunksHardLimit, m.mmappedChunksSoftLimit,
+		m.earlyFlushTriggered,
 		m.labelCatalogSize, m.labelCatalogCount,
 		m.labelCatalogSymbolsSize, m.labelCatalogSymbolsCount,
 		m.snapshotLoadDuration,

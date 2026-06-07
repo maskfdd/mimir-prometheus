@@ -162,9 +162,15 @@ func TestConcurrentAppendersFinalDefenseDropsOutOfOrder(t *testing.T) {
 	require.Equal(t, int64(200), s.lastTs)
 	require.Equal(t, int64(200), s.openMaxT)
 	// open chunk 只有 A 那一条（t=200）。
-	require.NotNil(t, s.openChunk)
-	require.Equal(t, 1, s.openChunk.NumSamples(),
-		"B 的 t=199 必须被最终防线丢弃，chunk 里只有 A 的一条样本")
+	// 由于 inline 优化，单条样本可能还在 inline 缓冲区中。
+	if s.openChunk != nil {
+		require.Equal(t, 1, s.openChunk.NumSamples(),
+			"B 的 t=199 必须被最终防线丢弃，chunk 里只有 A 的一条样本")
+	} else {
+		require.True(t, s.hasInlineSamples(), "单条样本必须在 inline 或 chunk 中")
+		require.Equal(t, uint8(1), s.inlineN,
+			"B 的 t=199 必须被最终防线丢弃，inline 里只有 A 的一条样本")
+	}
 	s.mu.Unlock()
 }
 
@@ -307,24 +313,32 @@ func TestCommitRunCoalescesSameSeries(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, app.Commit())
 
-	// 验证 A 的状态：lastTs=50，open chunk 5 条样本。
+	// 验证 A 的状态：lastTs=50，总共 5 条样本。
+	// 由于 inline 样本优化，前 maxInlineSamples 个样本可能在 inline 中，
+	// 超出后才会创建 open chunk。A 写了 5 条，超出了 inline 容量。
 	sA := h.refTab.get(chunks.HeadSeriesRef(refA))
 	require.NotNil(t, sA)
 	sA.mu.Lock()
 	require.Equal(t, int64(50), sA.lastTs)
 	require.Equal(t, int64(50), sA.openMaxT)
-	require.NotNil(t, sA.openChunk)
+	require.NotNil(t, sA.openChunk, "A 写了 5 条样本，超出 inline 容量，必须有 open chunk")
 	require.Equal(t, 5, sA.openChunk.NumSamples(), "A 必须完整写入 5 条样本")
 	sA.mu.Unlock()
 
-	// 验证 B 的状态：lastTs=25，open chunk 2 条样本。
+	// 验证 B 的状态：lastTs=25，总共 2 条样本。
+	// B 只写了 2 条样本，可能全在 inline 中（maxInlineSamples=2），此时 openChunk 为 nil。
 	sB := h.refTab.get(chunks.HeadSeriesRef(refB))
 	require.NotNil(t, sB)
 	sB.mu.Lock()
 	require.Equal(t, int64(25), sB.lastTs)
 	require.Equal(t, int64(25), sB.openMaxT)
-	require.NotNil(t, sB.openChunk)
-	require.Equal(t, 2, sB.openChunk.NumSamples(), "B 必须完整写入 2 条样本")
+	if sB.openChunk != nil {
+		require.Equal(t, 2, sB.openChunk.NumSamples(), "B 必须完整写入 2 条样本")
+	} else {
+		// inline 样本路径：验证 inline 中有 2 条样本。
+		require.True(t, sB.hasInlineSamples(), "B 若无 openChunk 则必须有 inline 样本")
+		require.Equal(t, uint8(2), sB.inlineN, "B inline 样本数量必须为 2")
+	}
 	sB.mu.Unlock()
 }
 

@@ -63,10 +63,10 @@ type appender struct {
 	pendingSamples []record.RefSample
 	sampleSeries   []*memSeries
 
-	// batchSeriesMaxT 记录"本 appender 本批次内对各 *memSeries 已登记过的
-	// 最大 t"。用于 Append 阶段 O(1) 判定批内乱序，避免依赖 s.openMaxT
-	// 所代表的"全局已写入状态"。reset() 时清空并复用 map。
-	batchSeriesMaxT map[*memSeries]int64
+	// batchGen 是本 appender 的批次代号，每次 Commit/Rollback 递增。
+	// 配合 memSeries.batchGen/batchMaxT 实现 O(1) 批内乱序检测，
+	// 替代之前的 map[*memSeries]int64，避免 map 分配和 delete 循环开销。
+	batchGen uint64
 }
 
 // GetRef 查找 labels 对应的 ref。
@@ -89,35 +89,27 @@ func (a *appender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v 
 		return 0, storage.ErrOutOfBounds
 	}
 
-	// 只读预检：读 s.lastTs / s.openMaxT，不修改 series 状态。
-	// 这两个字段只在 Commit 阶段被写入，读侧仍需 s.mu 以配对 Commit 的写。
+	// 只读预检 + 批内乱序检测：一次持锁完成所有检查和 batchGen 登记。
+	// batchGen/batchMaxT 存储在 memSeries 上，替代之前 appender 上的
+	// map[*memSeries]int64，实现 O(1) 批内乱序检测，无 map 分配开销。
 	s.mu.Lock()
 	lastTs := s.lastTs
 	openMaxT := s.openMaxT
 	openHasSamples := s.openChunk != nil && s.openChunk.NumSamples() > 0
+
+	if (lastTs != math.MinInt64 && t <= lastTs) ||
+		(openHasSamples && t <= openMaxT) ||
+		(s.batchGen == a.batchGen && t <= s.batchMaxT) {
+		s.mu.Unlock()
+		a.head.metrics.outOfOrderSamples.Inc()
+		return 0, storage.ErrOutOfOrderSample
+	}
+	// 登记本批次的 batchGen 和 batchMaxT。
+	s.batchGen = a.batchGen
+	s.batchMaxT = t
 	s.mu.Unlock()
 
-	if lastTs != math.MinInt64 && t <= lastTs {
-		a.head.metrics.outOfOrderSamples.Inc()
-		return 0, storage.ErrOutOfOrderSample
-	}
-	if openHasSamples && t <= openMaxT {
-		a.head.metrics.outOfOrderSamples.Inc()
-		return 0, storage.ErrOutOfOrderSample
-	}
-	// 批内乱序预检：同 appender 同 series 上本批次已登记过更晚的 t。
-	if a.batchSeriesMaxT != nil {
-		if prev, ok := a.batchSeriesMaxT[s]; ok && t <= prev {
-			a.head.metrics.outOfOrderSamples.Inc()
-			return 0, storage.ErrOutOfOrderSample
-		}
-	}
-
 	// 登记到 pending：真正的 open chunk 写入延后到 Commit。
-	if a.batchSeriesMaxT == nil {
-		a.batchSeriesMaxT = make(map[*memSeries]int64, 64)
-	}
-	a.batchSeriesMaxT[s] = t
 	a.pendingSamples = append(a.pendingSamples, record.RefSample{Ref: s.ref, T: t, V: v})
 	a.sampleSeries = append(a.sampleSeries, s)
 	return storage.SeriesRef(s.ref), nil
@@ -232,15 +224,58 @@ func (a *appender) commitSampleRun(s *memSeries, samples []record.RefSample) err
 			a.head.metrics.outOfOrderSamples.Inc()
 			continue
 		}
-
-		// open chunk 懒分配；必要时切新 chunk。
-		if a.ensureOpenChunk(s, t, chunkenc.EncXOR) {
-			a.head.metrics.chunksCreated.Inc()
+		// 对 inline 样本也做乱序检查。
+		if s.hasInlineSamples() && t <= s.inlineTs[s.inlineN-1] {
+			a.head.metrics.outOfOrderSamples.Inc()
+			continue
 		}
+
+		// P2 优化：inline 样本缓冲路径。
+		// 如果还没有 open chunk 且 inline 缓冲区未满，先存 inline，不分配 chunk。
+		// 仅当 SamplesPerChunk > maxInlineSamples 时启用：极端小 SamplesPerChunk 配置
+		// 下，inline 回填后立即触发 maybeCutChunk 会改变 seal 节奏，影响 forced flush
+		// 等依赖精确 seal 计数的逻辑。
+		if s.openChunk == nil && s.inlineN < maxInlineSamples &&
+			a.head.opts.SamplesPerChunk > int(maxInlineSamples) {
+			if s.inlineN == 0 {
+				// 首个 inline 样本，记录 openMinT（后续创建 chunk 时使用）。
+				s.openMinT = t
+			}
+			s.inlineTs[s.inlineN] = t
+			s.inlineVal[s.inlineN] = v
+			s.inlineN++
+			if t > s.lastTs {
+				s.lastTs = t
+			}
+			// 更新 openMaxT 以便乱序检测和 blockReader 使用。
+			if t > s.openMaxT {
+				s.openMaxT = t
+			}
+			if appended == 0 {
+				firstOK = t
+			}
+			lastOK = t
+			appended++
+			continue
+		}
+
+		// inline 已满或已有 open chunk：确保有 chunk，并将 inline 回填。
+		if s.openChunk == nil {
+			// 需要创建 chunk。如果有 inline 样本则从 openMinT 开始；
+			// 否则从当前样本 t 开始。
+			chunkStartT := t
+			if s.inlineN > 0 {
+				chunkStartT = s.openMinT
+			}
+			if a.ensureOpenChunk(s, chunkStartT, chunkenc.EncXOR) {
+				a.head.metrics.chunksCreated.Inc()
+			}
+			if s.inlineN > 0 {
+				s.flushInlineToChunk()
+			}
+		}
+
 		if err := a.maybeCutChunk(s, t, chunkenc.EncXOR); err != nil {
-			// maybeCutChunk 已在内部处理 Unlock/Lock 过渡（flushBlocking 路径），
-			// 返回时 s.mu 仍持有，由外层 defer 释放。
-			// 在返回错误前，把此前已经落盘的样本对应的 metric / minMaxTime 提交。
 			if appended > 0 {
 				a.head.metrics.samplesAppended.Add(appended)
 				a.head.updateMinMaxTime(firstOK)
@@ -336,22 +371,12 @@ func (a *appender) ensureOpenChunk(s *memSeries, t int64, enc chunkenc.Encoding)
 }
 
 // cutNewChunkLocked 切出新的 open chunk。须持有 s.mu。
-func (a *appender) cutNewChunkLocked(s *memSeries, t int64, enc chunkenc.Encoding) bool {
-	var chk chunkenc.Chunk
-	if chunkenc.IsValidEncoding(enc) {
-		var err error
-		chk, err = chunkenc.NewEmptyChunk(enc)
-		if err != nil {
-			chk = chunkenc.NewXORChunk()
-		}
-	} else {
-		chk = chunkenc.NewXORChunk()
-	}
-	app, err := chk.Appender()
-	if err != nil {
-		chk = chunkenc.NewXORChunk()
-		app, _ = chk.Appender()
-	}
+//
+// litehead 只支持 float samples，调用方始终传 EncXOR；因此直接创建 XOR chunk，
+// 不再做多级 encoding fallback。
+func (a *appender) cutNewChunkLocked(s *memSeries, t int64, _ chunkenc.Encoding) bool {
+	chk := chunkenc.NewXORChunk()
+	app, _ := chk.Appender()
 	s.openChunk = chk
 	s.openApp = app
 	s.openMinT = t
@@ -496,28 +521,20 @@ func (a *appender) logWAL() error {
 		}
 	}()
 
+	var recs [][]byte
 	if hasSeries {
 		seriesBufPtr = a.head.bufPool.Get().(*[]byte)
 		seriesBuf = enc.Series(a.pendingSeries, (*seriesBufPtr)[:0])
+		recs = append(recs, seriesBuf)
 	}
 	if hasSamples {
 		samplesBufPtr = a.head.bufPool.Get().(*[]byte)
 		samplesBuf = enc.Samples(a.pendingSamples, (*samplesBufPtr)[:0])
+		recs = append(recs, samplesBuf)
 	}
 
-	switch {
-	case hasSeries && hasSamples:
-		if err := a.head.wal.Log(seriesBuf, samplesBuf); err != nil {
-			return errors.Wrap(err, "log WAL series+samples")
-		}
-	case hasSeries:
-		if err := a.head.wal.Log(seriesBuf); err != nil {
-			return errors.Wrap(err, "log WAL series")
-		}
-	case hasSamples:
-		if err := a.head.wal.Log(samplesBuf); err != nil {
-			return errors.Wrap(err, "log WAL samples")
-		}
+	if err := a.head.wal.Log(recs...); err != nil {
+		return errors.Wrap(err, "log WAL")
 	}
 	return nil
 }
@@ -549,10 +566,9 @@ func (a *appender) reset() {
 	a.pendingSeries = a.pendingSeries[:0]
 	a.pendingSamples = a.pendingSamples[:0]
 	a.sampleSeries = a.sampleSeries[:0]
-	// 清 batchSeriesMaxT 但保留底层 buckets 以便复用。map 没有原生 truncate，
-	// 用 delete 循环；在稳态批量大小（~千条）下成本可接受，远低于每次 make。
-	for k := range a.batchSeriesMaxT {
-		delete(a.batchSeriesMaxT, k)
-	}
+	// 从全局原子计数器获取新的唯一 batchGen：下次 Append 时，memSeries 上存储的
+	// 旧 batchGen 不再匹配，等价于清空旧的批内乱序检测状态。O(1) 成本且保证
+	// 跨 appender 实例不冲突。
+	a.batchGen = head.nextBatchGen.Inc()
 	head.appenderPool.Put(a)
 }

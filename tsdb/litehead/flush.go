@@ -147,8 +147,7 @@ func (h *Head) compactHeadWindowOpts(mint, maxt int64, gcSeries bool) error {
 	}
 
 	ctx := context.Background()
-	compactor, err := tsdb.NewLeveledCompactor(ctx, nil, h.logger,
-		[]int64{h.opts.BlockDuration}, chunkenc.NewPool(), nil, true)
+	compactor, err := h.getOrCreateCompactor(ctx)
 	if err != nil {
 		h.metrics.compactionsFailed.Inc()
 		if prevMinValidTime > math.MinInt64 {
@@ -236,6 +235,12 @@ func (h *Head) truncateMmapped(flushMaxt int64) {
 			s.openMaxT = math.MinInt64
 			s.nextAt = 0
 		}
+		// P2 优化：同样清理已被 flush 的 inline 样本。
+		if s.hasInlineSamples() && s.openMaxT != math.MinInt64 && s.openMaxT <= flushMaxt {
+			s.resetInline()
+			s.openMinT = 0
+			s.openMaxT = math.MinInt64
+		}
 		s.mu.Unlock()
 	})
 
@@ -262,7 +267,7 @@ func (h *Head) sweepDeadSeries(flushMaxt int64) {
 
 	h.refTab.forEach(func(s *memSeries) {
 		s.mu.Lock()
-		dead := s.openChunk == nil && s.sealedLen() == 0 && s.lastTs <= flushMaxt
+		dead := s.openChunk == nil && !s.hasInlineSamples() && s.sealedLen() == 0 && s.lastTs <= flushMaxt
 		if dead {
 			deadRefs = append(deadRefs, s.ref)
 			deadLabelsIDs = append(deadLabelsIDs, s.labelsID)
@@ -384,4 +389,19 @@ func (h *Head) truncateWAL(mint int64) error {
 	h.metrics.checkpointCreationTotal.Inc()
 	h.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
 	return nil
+}
+
+// getOrCreateCompactor 返回复用的 LeveledCompactor 实例。
+// 受 flushMtx 保护，无需额外同步。
+func (h *Head) getOrCreateCompactor(ctx context.Context) (*tsdb.LeveledCompactor, error) {
+	if h.compactor != nil {
+		return h.compactor, nil
+	}
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, h.logger,
+		[]int64{h.opts.BlockDuration}, chunkenc.NewPool(), nil, true)
+	if err != nil {
+		return nil, err
+	}
+	h.compactor = c
+	return c, nil
 }

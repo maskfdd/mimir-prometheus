@@ -78,7 +78,19 @@ func (h *Head) SelfCompact(_ context.Context) (bool, error) {
 	h.appenderMtx.Lock()
 	defer h.appenderMtx.Unlock()
 
-	if !h.compactable() {
+	shouldFlush := h.compactable()
+
+	// P0 优化：全局 series 水位驱动的 early flush。
+	// 即使时间跨度未达 compactable() 阈值，当活跃 series 数量超过
+	// EarlyFlushMinSeries 时也提前触发 flush，避免高 series 数量场景下
+	// 内存积压 3h 数据。
+	if !shouldFlush && h.opts.EarlyFlushMinSeries > 0 &&
+		int64(h.numSeries.Load()) >= h.opts.EarlyFlushMinSeries {
+		shouldFlush = true
+		h.metrics.earlyFlushTriggered.Inc()
+	}
+
+	if !shouldFlush {
 		return true, nil
 	}
 	if err := h.tryFlushAligned(); err != nil {

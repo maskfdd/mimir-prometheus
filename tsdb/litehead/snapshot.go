@@ -204,8 +204,7 @@ func (h *Head) writeSnapshot() error {
 	// batchCh: worker -> main，`[][]byte` 批记录
 	// errCh:   worker -> main，首个错误
 	type batch struct {
-		buf  []byte   // 整块字节缓冲；保证 records 切片指向的都是此 buf 的 sub-slice
-		recs [][]byte // records 引用 buf 的区间
+		recs [][]byte
 	}
 	batchCh := make(chan batch, workerCount*2)
 	errCh := make(chan error, workerCount)
@@ -229,7 +228,7 @@ func (h *Head) writeSnapshot() error {
 				// 把当前 batch 交出去；自己起新的底层 buf，避免后续 append 影响
 				// 已交出的 records（append 到 full-cap 时会替换底层数组，会污染）。
 				select {
-				case batchCh <- batch{buf: buf, recs: recs}:
+				case batchCh <- batch{recs: recs}:
 				case <-errCh:
 					// 已有错误发生，不再入队。
 				}

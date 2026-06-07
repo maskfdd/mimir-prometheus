@@ -116,9 +116,6 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 			openMaxT := s.openMaxT
 			if openMaxT >= mint && openMinT <= maxt {
 				b := s.openChunk.Bytes()
-				// 从 snapshotBufPool 借出 scratch buffer 来冻结 open chunk 字节。
-				// pool 对象是 *[]byte；我们按需扩容，再把 live bytes copy 进去。
-				// 对应的 *[]byte 统一挂到 r.openBufs，由 reader 全部 Close 后一次性归还。
 				pb := h.snapshotBufPool.Get().(*[]byte)
 				buf := (*pb)
 				if cap(buf) < len(b) {
@@ -129,13 +126,41 @@ func newBlockReader(h *Head, mint, maxt int64) *blockReader {
 				copy(buf, b)
 				*pb = buf
 				r.openBufs = append(r.openBufs, pb)
-				// 对齐标准 Head 的对外语义：仍把 open chunk 暴露成"可增长"块。
-				// 真正的字节和编码已经在快照阶段冻结，避免 Chunk() 再回看 live 状态。
 				descs = append(descs, chunkDescriptor{
 					minTime:      openMinT,
 					maxTime:      math.MaxInt64,
 					kind:         chunkSourceOpen,
 					openEncoding: s.openChunk.Encoding(),
+					openBytes:    buf,
+				})
+			}
+		} else if s.hasInlineSamples() {
+			// P2 优化：处理 inline 样本。它们尚未被写入 open chunk，
+			// 需要临时创建一个 XOR chunk 来编码 inline 样本。
+			openMinT := s.openMinT
+			openMaxT := s.openMaxT
+			if openMaxT >= mint && openMinT <= maxt {
+				chk := chunkenc.NewXORChunk()
+				app, _ := chk.Appender()
+				for i := uint8(0); i < s.inlineN; i++ {
+					app.Append(s.inlineTs[i], s.inlineVal[i])
+				}
+				b := chk.Bytes()
+				pb := h.snapshotBufPool.Get().(*[]byte)
+				buf := (*pb)
+				if cap(buf) < len(b) {
+					buf = make([]byte, len(b))
+				} else {
+					buf = buf[:len(b)]
+				}
+				copy(buf, b)
+				*pb = buf
+				r.openBufs = append(r.openBufs, pb)
+				descs = append(descs, chunkDescriptor{
+					minTime:      openMinT,
+					maxTime:      math.MaxInt64,
+					kind:         chunkSourceOpen,
+					openEncoding: chunkenc.EncXOR,
 					openBytes:    buf,
 				})
 			}
@@ -210,6 +235,12 @@ func seriesOverlapsWindowLocked(s *memSeries, mint, maxt int64) bool {
 		}
 	}
 	if s.openChunk != nil && s.openChunk.NumSamples() > 0 {
+		if s.openMaxT >= mint && s.openMinT <= maxt {
+			return true
+		}
+	}
+	// P2 优化：检查 inline 样本。
+	if s.hasInlineSamples() {
 		if s.openMaxT >= mint && s.openMinT <= maxt {
 			return true
 		}

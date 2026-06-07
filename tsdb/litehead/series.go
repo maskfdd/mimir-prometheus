@@ -28,12 +28,60 @@ type memSeries struct {
 	openMaxT  int64
 	nextAt    int64
 
+	// batchGen 和 batchMaxT 配合 appender 的 batchGen 实现 O(1) 批内乱序检测。
+	// 替代之前 appender 上的 map[*memSeries]int64，避免 map 分配和 delete 循环。
+	// 每次 appender Commit/Rollback 递增 appender.batchGen，下次 Append 时
+	// 如果 s.batchGen != a.batchGen 则说明上一批已经结束，可以直接覆盖。
+	batchGen  uint64
+	batchMaxT int64
+
+	// inlineTs/inlineVal/inlineN 实现 open chunk 的懒初始化。
+	// 对于低频 series（只写 1-2 个样本后就不再活跃的），延迟创建真正的
+	// XOR chunk，节省 ~200-500B/series 的 chunk 分配开销。
+	// 当 inlineN > 0 且 openChunk == nil 时，样本存储在 inline 中。
+	// 一旦 inline 写满（inlineN == maxInlineSamples）或需要切 chunk 时，
+	// 才真正创建 XOR chunk 并将 inline 样本回填进去。
+	inlineTs  [maxInlineSamples]int64
+	inlineVal [maxInlineSamples]float64
+	inlineN   uint8
+
 	// sealedCount 是 sealedInline + sealedOverflow 中活跃条目数。
 	// sealedCount==0 时，sealedInline 无效；sealedCount==1 时，只有 sealedInline 有效；
 	// sealedCount>=2 时，sealedInline 为第 0 条，sealedOverflow 为第 1..n-1 条。
 	sealedCount    uint16
 	sealedInline   mmappedChunk
 	sealedOverflow []mmappedChunk
+}
+
+// maxInlineSamples 是 inline 样本缓冲区大小。设为 2 可以覆盖绝大多数
+// "只写 1-2 个样本就不再活跃"的 churn 场景，同时保持 memSeries 结构紧凑。
+// 增大此值会增加 memSeries 的基线大小（每个 slot 16 bytes），需要权衡。
+const maxInlineSamples = 2
+
+// hasInlineSamples 返回是否有尚未被 flush 到 open chunk 的 inline 样本。
+// 调用方须持有 s.mu。
+func (s *memSeries) hasInlineSamples() bool {
+	return s.inlineN > 0 && s.openChunk == nil
+}
+
+// flushInlineToChunk 将 inline 样本回填到 open chunk 中。
+// 调用方须持有 s.mu，且调用前已通过 ensureOpenChunk 创建了 chunk。
+func (s *memSeries) flushInlineToChunk() {
+	if s.inlineN == 0 || s.openChunk == nil {
+		return
+	}
+	for i := uint8(0); i < s.inlineN; i++ {
+		s.openApp.Append(s.inlineTs[i], s.inlineVal[i])
+		if s.inlineTs[i] > s.openMaxT {
+			s.openMaxT = s.inlineTs[i]
+		}
+	}
+	s.inlineN = 0
+}
+
+// resetInline 清空 inline 样本（flush 后调用）。调用方须持有 s.mu。
+func (s *memSeries) resetInline() {
+	s.inlineN = 0
 }
 
 // defaultHardMmappedChunksPerSeries 是单条 series 在内存中允许持有的 sealed mmapped
@@ -302,7 +350,15 @@ func (t *refTable) snapshotPages() []*refPage {
 	return out
 }
 
-// ----- hashIndex：分片 map -----
+// ----- hashIndex：分片 flat map -----
+//
+// P1 优化：将每个 stripe 从 map[uint64][]refEntry 改为双层结构：
+//   - primary: map[uint64]refEntry — 绝大部分 hash 只对应 1 条 series（无冲突），
+//     直接存储 refEntry 而非 []refEntry 切片，省去 slice header (24B) + cap 对齐开销。
+//   - overflow: map[uint64][]refEntry — 仅存储 hash 冲突的第 2..N 条 entry。
+//
+// 在典型生产场景中 >99% 的 hash 无冲突，overflow 极少被使用。
+// 100 万 series 场景下预期节省 ~20-25 MB（每条 series 省去一个 slice header）。
 
 const hashStripeCount = 256
 
@@ -312,14 +368,16 @@ type refEntry struct {
 }
 
 type hashIndex struct {
-	locks   [hashStripeCount]sync.RWMutex
-	buckets [hashStripeCount]map[uint64][]refEntry
+	locks    [hashStripeCount]sync.RWMutex
+	primary  [hashStripeCount]map[uint64]refEntry
+	overflow [hashStripeCount]map[uint64][]refEntry
 }
 
 func newHashIndex() *hashIndex {
 	h := &hashIndex{}
-	for i := range h.buckets {
-		h.buckets[i] = make(map[uint64][]refEntry)
+	for i := range h.primary {
+		h.primary[i] = make(map[uint64]refEntry)
+		h.overflow[i] = make(map[uint64][]refEntry)
 	}
 	return h
 }
@@ -327,11 +385,18 @@ func newHashIndex() *hashIndex {
 func (h *hashIndex) get(hash uint64, lset labels.Labels, lc *labelCatalog) (chunks.HeadSeriesRef, bool) {
 	i := hash % hashStripeCount
 	h.locks[i].RLock()
-	entries := h.buckets[i][hash]
-	for _, e := range entries {
+	// 先查 primary。
+	if e, ok := h.primary[i][hash]; ok {
 		if lc.equals(e.labelsID, lset) {
 			h.locks[i].RUnlock()
 			return e.ref, true
+		}
+		// primary 不匹配，查 overflow。
+		for _, oe := range h.overflow[i][hash] {
+			if lc.equals(oe.labelsID, lset) {
+				h.locks[i].RUnlock()
+				return oe.ref, true
+			}
 		}
 	}
 	h.locks[i].RUnlock()
@@ -340,25 +405,58 @@ func (h *hashIndex) get(hash uint64, lset labels.Labels, lc *labelCatalog) (chun
 
 func (h *hashIndex) put(hash uint64, ref chunks.HeadSeriesRef, labelsID uint32) {
 	i := hash % hashStripeCount
+	e := refEntry{ref: ref, labelsID: labelsID}
 	h.locks[i].Lock()
-	h.buckets[i][hash] = append(h.buckets[i][hash], refEntry{ref: ref, labelsID: labelsID})
+	if _, exists := h.primary[i][hash]; !exists {
+		// 无冲突：直接存 primary。
+		h.primary[i][hash] = e
+	} else {
+		// hash 冲突：追加到 overflow。
+		h.overflow[i][hash] = append(h.overflow[i][hash], e)
+	}
 	h.locks[i].Unlock()
 }
 
 func (h *hashIndex) delete(hash uint64, ref chunks.HeadSeriesRef) {
 	i := hash % hashStripeCount
 	h.locks[i].Lock()
-	entries := h.buckets[i][hash]
-	out := entries[:0]
-	for _, e := range entries {
+	pe, hasPrimary := h.primary[i][hash]
+	if !hasPrimary {
+		h.locks[i].Unlock()
+		return
+	}
+
+	ov := h.overflow[i][hash]
+
+	if pe.ref == ref {
+		// 要删的是 primary entry。
+		if len(ov) > 0 {
+			// 把 overflow 的第一条提升为 primary。
+			h.primary[i][hash] = ov[0]
+			if len(ov) == 1 {
+				delete(h.overflow[i], hash)
+			} else {
+				h.overflow[i][hash] = ov[1:]
+			}
+		} else {
+			// 无 overflow，直接删除。
+			delete(h.primary[i], hash)
+		}
+		h.locks[i].Unlock()
+		return
+	}
+
+	// 要删的在 overflow 中。
+	out := ov[:0]
+	for _, e := range ov {
 		if e.ref != ref {
 			out = append(out, e)
 		}
 	}
 	if len(out) == 0 {
-		delete(h.buckets[i], hash)
+		delete(h.overflow[i], hash)
 	} else {
-		h.buckets[i][hash] = out
+		h.overflow[i][hash] = out
 	}
 	h.locks[i].Unlock()
 }

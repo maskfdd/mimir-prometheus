@@ -85,6 +85,13 @@ type Options struct {
 
 	FlushCheckInterval time.Duration
 
+	// EarlyFlushMinSeries 全局 series 数量达到此阈值时，即使时间跨度未达
+	// ChunkRange*3/2，也提前触发一次 tryFlushAligned。这是借鉴 Mimir Block
+	// Builder 的 CompactToReduceInMemorySeries 策略：当内存中 series 数量过多
+	// 时，主动触发 compact 释放内存，避免"攒 3h 数据"导致的高内存占用。
+	// <=0 表示关闭此功能。
+	EarlyFlushMinSeries int64
+
 	NoLockfile bool
 
 	// SeriesLifecycleCallback specifies callbacks invoked during a series lifecycle.
@@ -206,6 +213,14 @@ type Head struct {
 	appenderMtx sync.RWMutex
 	flushMtx    sync.Mutex
 
+	// compactor 复用 LeveledCompactor 实例，避免每次 flush 都重新分配。
+	// 受 flushMtx 保护，无需额外同步。
+	compactor *tsdb.LeveledCompactor
+
+	// nextBatchGen 是全局原子计数器，为每个 appender 实例分配唯一的 batchGen。
+	// 确保不同 appender 实例的 batchGen 不会冲突。
+	nextBatchGen atomic.Uint64
+
 	dir    string
 	locker *tsdbutil.DirLocker
 }
@@ -274,6 +289,7 @@ func NewHead(logger log.Logger, reg prometheus.Registerer, dir string, opts *Opt
 			pendingSeries:  make([]record.RefSeries, 0, 256),
 			pendingSamples: make([]record.RefSample, 0, 1024),
 			sampleSeries:   make([]*memSeries, 0, 1024),
+			batchGen:       h.nextBatchGen.Inc(),
 		}
 	}
 
