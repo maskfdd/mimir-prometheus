@@ -232,11 +232,16 @@ func NewHead(logger log.Logger, reg prometheus.Registerer, dir string, opts *Opt
 	}
 	opts = opts.validate()
 
-	locker, err := tsdbutil.NewDirLocker(dir, lockfileName, logger, reg)
-	if err != nil {
-		return nil, err
-	}
+	// 当 NoLockfile=true 时，表示上层（如 tsdb.DB）已经负责目录锁和
+	// prometheus_tsdb_clean_start metric 的注册；litehead 不再重复创建
+	// DirLocker，避免向同一个 Registerer 重复注册同名 metric 导致 panic。
+	var locker *tsdbutil.DirLocker
 	if !opts.NoLockfile {
+		var err error
+		locker, err = tsdbutil.NewDirLocker(dir, lockfileName, logger, reg)
+		if err != nil {
+			return nil, err
+		}
 		if err := locker.Lock(); err != nil {
 			return nil, err
 		}
@@ -341,8 +346,10 @@ func (h *Head) Close() error {
 	if err := h.wal.Close(); err != nil {
 		errs.Add(errors.Wrap(err, "close WAL"))
 	}
-	if err := h.locker.Release(); err != nil {
-		errs.Add(errors.Wrap(err, "release lock"))
+	if h.locker != nil {
+		if err := h.locker.Release(); err != nil {
+			errs.Add(errors.Wrap(err, "release lock"))
+		}
 	}
 
 	h.metrics.unregister()

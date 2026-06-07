@@ -83,20 +83,22 @@ func newHeadMetrics(r prometheus.Registerer) *headMetrics {
 		Help: "Total number of out-of-order samples rejected.",
 	})
 
-	// ---- prometheus_tsdb_compactions_* 这组指标在标准 DB 里，Head 里没有；
-	// 这里沿用 mimir/tsdb.DB 的命名，方便统一观测 compact 行为。----
+	// ---- litehead flush-to-block 指标 ----
+	// 使用 prometheus_tsdb_litehead_* 前缀，避免与 DB 层的
+	// prometheus_tsdb_compactions_* / compaction_duration_seconds 冲突——
+	// 两者语义不同：DB 层是磁盘 block 合并，litehead 是内存 flush 成 block。
 
 	m.compactionsTriggered = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_compactions_triggered_total",
-		Help: "Total number of triggered compactions for the lite head.",
+		Name: "prometheus_tsdb_litehead_compactions_triggered_total",
+		Help: "Total number of triggered flush-to-block compactions for the lite head.",
 	})
 	m.compactionsFailed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "prometheus_tsdb_compactions_failed_total",
-		Help: "Total number of compactions that failed for the lite head.",
+		Name: "prometheus_tsdb_litehead_compactions_failed_total",
+		Help: "Total number of flush-to-block compactions that failed for the lite head.",
 	})
 	m.compactionDuration = prometheus.NewSummary(prometheus.SummaryOpts{
-		Name: "prometheus_tsdb_compaction_duration_seconds",
-		Help: "Duration of lite head compactions (producing a block).",
+		Name: "prometheus_tsdb_litehead_compaction_duration_seconds",
+		Help: "Duration of lite head flush-to-block compactions.",
 	})
 
 	// ---- prometheus_tsdb_wal_* / prometheus_tsdb_checkpoint_* ----

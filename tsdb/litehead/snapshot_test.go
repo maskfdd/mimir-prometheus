@@ -259,7 +259,9 @@ func TestSnapshotPlusIncrementalWAL(t *testing.T) {
 	// 不调用 Close()，直接关闭底层资源模拟 crash。
 	h2.chunkDiskMapper.Close()
 	h2.wal.Close()
-	h2.locker.Release()
+	if h2.locker != nil {
+		h2.locker.Release()
+	}
 
 	// 阶段 3：再次打开。snapshot 恢复阶段1的 series，
 	// 增量 WAL 恢复阶段2的 sample。
@@ -363,7 +365,9 @@ func TestNoSnapshotFallbackToWALReplay(t *testing.T) {
 	// 不调用 Close，直接关底层资源（模拟 crash，不会产生 snapshot）。
 	h.chunkDiskMapper.Close()
 	h.wal.Close()
-	h.locker.Release()
+	if h.locker != nil {
+		h.locker.Release()
+	}
 
 	// 重新打开，应该通过 WAL replay 恢复。
 	h2, err := NewHead(log.NewNopLogger(), nil, dir, opts)

@@ -103,7 +103,9 @@ func TestCrashAfterCommitBeforeFlushRecoverable(t *testing.T) {
 	// 这样 WAL 内容落盘，但 block 尚未生成。
 	require.NoError(t, h1.chunkDiskMapper.Close())
 	require.NoError(t, h1.wal.Close())
-	require.NoError(t, h1.locker.Release())
+	if h1.locker != nil {
+		require.NoError(t, h1.locker.Release())
+	}
 
 	// 崩溃前应该尚未产生任何 block。
 	require.Equal(t, 0, countBlocks(t, dir), "no block expected before first flush")
