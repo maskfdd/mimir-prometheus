@@ -448,6 +448,18 @@ func (h *Head) Flush() error {
 	return h.tryFlushAll()
 }
 
+// ForceFlush 强制 flush 所有内存数据到 block，不检查 compactable() 阈值。
+// 与 SelfCompact 不同，ForceFlush 总是执行 flush，用于 idle/force compaction
+// 场景下确保 liteDB 的数据被持久化，以便 TSDB 可以被关闭。
+//
+// 调用方须确保不会有并发写入（例如 ingester 已停止推送）。
+func (h *Head) ForceFlush() error {
+	h.appenderMtx.Lock()
+	defer h.appenderMtx.Unlock()
+
+	return h.tryFlushAll()
+}
+
 // AppendableMinValidTime 返回当前允许写入的最小时间。
 func (h *Head) AppendableMinValidTime() int64 {
 	return h.appendableMinValidTime()

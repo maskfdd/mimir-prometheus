@@ -347,3 +347,111 @@ func (s *symbolTable) snapshotList() []string {
 	copy(out, s.list)
 	return out
 }
+
+// rebuild 重建 labelCatalog：只保留 aliveIDs 集合中的 labelsID，
+// 丢弃所有已死的 series 编码和不再引用的 symbol。
+//
+// 调用时机：在 sweepDeadSeries 之后，由 truncateMemory 调用。
+// 调用方须确保不会有并发写入（appenderMtx.Lock 已持有）。
+//
+// 返回旧 labelsID -> 新 labelsID 的映射，调用方须据此更新 memSeries.labelsID。
+// 如果活跃 series 为空，不执行重建，返回 nil。
+func (lc *labelCatalog) rebuild(aliveIDs map[uint32]struct{}) map[uint32]uint32 {
+	if len(aliveIDs) == 0 {
+		return nil
+	}
+
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+
+	// 第一步：收集所有活跃的 labelsID 并解码。
+	type entry struct {
+		oldID uint32
+		data  []byte
+	}
+	entries := make([]entry, 0, len(aliveIDs))
+	for oldID := range aliveIDs {
+		buf := lc.sliceLocked(oldID)
+		cp := make([]byte, len(buf))
+		copy(cp, buf)
+		entries = append(entries, entry{oldID: oldID, data: cp})
+	}
+
+	// 第二步：重建 symbolTable — 只保留被活跃编码引用的 symbol。
+	// 为简化实现，直接重建一个新的 symbolTable。
+	newSyms := symbolTable{}
+	newSyms.init()
+
+	// 第三步：重编码所有活跃条目。
+	newChunks := [][]byte{make([]byte, 0, labelCatalogChunkSize)}
+	newChunkIDs := make([]uint32, 0, len(entries))
+	newChunkOffsets := make([]uint32, 0, len(entries))
+	newLengths := make([]uint32, 0, len(entries))
+
+	oldToNew := make(map[uint32]uint32, len(entries))
+
+	for _, e := range entries {
+		// 解码旧编码中的 symbol ID，重新 intern 到新 symbolTable。
+		dec := encoding.Decbuf{B: e.data}
+		n := dec.Uvarint()
+		var enc encoding.Encbuf
+		enc.PutUvarint(n)
+		for i := 0; i < n; i++ {
+			oldNameID := uint32(dec.Uvarint())
+			oldValueID := uint32(dec.Uvarint())
+			// 查旧 symbolTable 获取字符串。
+			name := lc.syms.lookupLocked(oldNameID)
+			value := lc.syms.lookupLocked(oldValueID)
+			enc.PutUvarint32(newSyms.intern(name))
+			enc.PutUvarint32(newSyms.intern(value))
+		}
+		encoded := enc.Get()
+		encLen := uint32(len(encoded))
+
+		// 放入新 arena。
+		active := len(newChunks) - 1
+		if remaining := cap(newChunks[active]) - len(newChunks[active]); uint32(remaining) < encLen {
+			if encLen > labelCatalogChunkSize {
+				over := make([]byte, 0, encLen)
+				newChunks = append(newChunks, over)
+				active = len(newChunks) - 1
+				fresh := make([]byte, 0, labelCatalogChunkSize)
+				newChunks = append(newChunks, fresh)
+			} else {
+				fresh := make([]byte, 0, labelCatalogChunkSize)
+				newChunks = append(newChunks, fresh)
+				active = len(newChunks) - 1
+			}
+		}
+
+		newID := uint32(len(newChunkIDs))
+		chunkID := uint32(active)
+		offset := uint32(len(newChunks[active]))
+		newChunks[active] = append(newChunks[active], encoded...)
+
+		newChunkIDs = append(newChunkIDs, chunkID)
+		newChunkOffsets = append(newChunkOffsets, offset)
+		newLengths = append(newLengths, encLen)
+
+		oldToNew[e.oldID] = newID
+	}
+
+	// 第四步：替换所有内部状态。
+	lc.chunks = newChunks
+	lc.chunkIDs = newChunkIDs
+	lc.chunkOffsets = newChunkOffsets
+	lc.lengths = newLengths
+	lc.syms = newSyms
+
+	return oldToNew
+}
+
+// lookupLocked 在 symbolTable 已持有外部锁时使用（rebuild 内部调用）。
+func (s *symbolTable) lookupLocked(id uint32) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if int(id) >= len(s.list) {
+		return ""
+	}
+	return s.list[id]
+}

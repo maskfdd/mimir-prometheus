@@ -232,6 +232,41 @@ func (t *refTable) del(ref chunks.HeadSeriesRef) {
 	t.mu.Unlock()
 }
 
+// compactPages 释放所有条目为空的 page 指针（置 nil），并回收尾部连续 nil page
+// 占用的 slice 空间。在 sweepDeadSeries 之后调用，可显著降低高 churn 场景下
+// refTable 的长期内存占用。
+//
+// 成本：O(pages * pageSize)，每个 page 扫一遍判断是否全空。
+// 在默认 pageSize=16384 下，100 万 series churn 产生 ~61 个 page，扫描耗时微秒级。
+func (t *refTable) compactPages() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// 把所有 entry 全空的 page 置 nil。
+	for i, p := range t.pages {
+		if p == nil {
+			continue
+		}
+		empty := true
+		for _, e := range p.entries {
+			if e != nil {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			t.pages[i] = nil
+		}
+	}
+
+	// 从尾部裁剪连续 nil page，缩减 slice 长度。
+	n := len(t.pages)
+	for n > 0 && t.pages[n-1] == nil {
+		n--
+	}
+	t.pages = t.pages[:n]
+}
+
 // forEach 遍历所有活跃 series。回调期间持有读锁，禁止在回调内写。
 func (t *refTable) forEach(fn func(*memSeries)) {
 	t.mu.RLock()

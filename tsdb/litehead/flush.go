@@ -226,7 +226,6 @@ func (h *Head) sweepDeadSeries(flushMaxt int64) {
 		s.mu.Unlock()
 	})
 
-	// labelsID 驻留在 labelCatalog arena 里（append-only），仅在 arena 重建时回收。
 	for i, ref := range deadRefs {
 		s := h.refTab.get(ref)
 		if s == nil {
@@ -240,6 +239,45 @@ func (h *Head) sweepDeadSeries(flushMaxt int64) {
 		h.numSeries.Dec()
 		h.metrics.seriesActive.Dec()
 		h.metrics.seriesRemoved.Inc()
+	}
+
+	// 回收 refTable 中全空的 page，释放不可达的 refPage 内存。
+	if len(deadRefs) > 0 {
+		h.refTab.compactPages()
+	}
+
+	// 重建 labelCatalog arena：只保留活跃 series 的编码，回收死 series
+	// 的标签编码和不再引用的 symbol，避免 append-only 导致长期内存增长。
+	// rebuild 的成本与活跃 series 数成正比，在典型 flush 间隔下可接受。
+	if len(deadRefs) > 0 {
+		aliveIDs := make(map[uint32]struct{})
+		h.refTab.forEach(func(s *memSeries) {
+			s.mu.Lock()
+			aliveIDs[s.labelsID] = struct{}{}
+			s.mu.Unlock()
+		})
+
+		if oldToNew := h.labelCat.rebuild(aliveIDs); oldToNew != nil {
+			// 更新所有活跃 series 的 labelsID 映射以及 hashIdx。
+			h.refTab.forEach(func(s *memSeries) {
+				s.mu.Lock()
+				if newID, ok := oldToNew[s.labelsID]; ok {
+					s.labelsID = newID
+				}
+				s.mu.Unlock()
+			})
+
+			// 重建 hashIdx：rebuild 改变了 labelsID，hashIdx 中的 refEntry.labelsID
+			// 需要同步更新。最简单且安全的方式是清空后重建。
+			newHashIdx := newHashIndex()
+			h.refTab.forEach(func(s *memSeries) {
+				s.mu.Lock()
+				lset := h.labelCat.get(s.labelsID)
+				newHashIdx.put(lset.Hash(), s.ref, s.labelsID)
+				s.mu.Unlock()
+			})
+			h.hashIdx = newHashIdx
+		}
 	}
 }
 
