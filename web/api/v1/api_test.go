@@ -37,7 +37,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/route"
 	"github.com/stretchr/testify/require"
 
@@ -446,20 +445,9 @@ func TestEndpoints(t *testing.T) {
 		u, err := url.Parse(server.URL)
 		require.NoError(t, err)
 
-		al := promlog.AllowedLevel{}
-		require.NoError(t, al.Set("debug"))
-
-		af := promlog.AllowedFormat{}
-		require.NoError(t, af.Set("logfmt"))
-
-		promlogConfig := promlog.Config{
-			Level:  &al,
-			Format: &af,
-		}
-
 		dbDir := t.TempDir()
 
-		remote := remote.NewStorage(promlog.New(&promlogConfig), prometheus.DefaultRegisterer, func() (int64, error) {
+		remote := remote.NewStorage(log.NewLogfmtLogger(os.Stderr), prometheus.DefaultRegisterer, func() (int64, error) {
 			return 0, nil
 		}, dbDir, 1*time.Second, nil)
 

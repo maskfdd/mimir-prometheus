@@ -34,8 +34,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
 
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/graphite"
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/influxdb"
@@ -57,7 +55,6 @@ type config struct {
 	remoteTimeout           time.Duration
 	listenAddr              string
 	telemetryPath           string
-	promlogConfig           promlog.Config
 }
 
 var (
@@ -102,7 +99,7 @@ func main() {
 	cfg := parseFlags()
 	http.Handle(cfg.telemetryPath, promhttp.Handler())
 
-	logger := promlog.New(&cfg.promlogConfig)
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 
 	writers, readers := buildClients(logger, cfg)
 	if err := serve(logger, cfg.listenAddr, writers, readers); err != nil {
@@ -117,7 +114,6 @@ func parseFlags() *config {
 
 	cfg := &config{
 		influxdbPassword: os.Getenv("INFLUXDB_PW"),
-		promlogConfig:    promlog.Config{},
 	}
 
 	a.Flag("graphite-address", "The host:port of the Graphite server to send samples to. None, if empty.").
@@ -142,8 +138,6 @@ func parseFlags() *config {
 		Default(":9201").StringVar(&cfg.listenAddr)
 	a.Flag("web.telemetry-path", "Address to listen on for web endpoints.").
 		Default("/metrics").StringVar(&cfg.telemetryPath)
-
-	flag.AddFlags(a, &cfg.promlogConfig)
 
 	_, err := a.Parse(os.Args[1:])
 	if err != nil {

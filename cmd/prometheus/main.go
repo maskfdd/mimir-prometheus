@@ -42,8 +42,6 @@ import (
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/common/promlog"
-	promlogflag "github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	toolkit_web "github.com/prometheus/exporter-toolkit/web"
 	"go.uber.org/atomic"
@@ -157,7 +155,6 @@ type flagConfig struct {
 	prometheusURL   string
 	corsRegexString string
 
-	promlogConfig promlog.Config
 }
 
 // setFeatureListOptions sets the corresponding options from the featureList.
@@ -237,7 +234,6 @@ func main() {
 			Registerer: prometheus.DefaultRegisterer,
 			Gatherer:   prometheus.DefaultGatherer,
 		},
-		promlogConfig: promlog.Config{},
 	}
 
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server").UsageWriter(os.Stdout)
@@ -422,8 +418,6 @@ func main() {
 	a.Flag("enable-feature", "Comma separated feature names to enable. Valid options: agent, exemplar-storage, expand-external-labels, memory-snapshot-on-shutdown, promql-at-modifier, promql-negative-offset, promql-per-step-stats, remote-write-receiver (DEPRECATED), extra-scrape-metrics, new-service-discovery-manager, auto-gomaxprocs, no-default-scrape-port, native-histograms, otlp-write-receiver. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details.").
 		Default("").StringsVar(&cfg.featureList)
 
-	promlogflag.AddFlags(a, &cfg.promlogConfig)
-
 	a.Flag("write-documentation", "Generate command line documentation. Internal use.").Hidden().Action(func(ctx *kingpin.ParseContext) error {
 		if err := documentcli.GenerateMarkdown(a.Model(), os.Stdout); err != nil {
 			os.Exit(1)
@@ -440,7 +434,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	logger := promlog.New(&cfg.promlogConfig)
+	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 
 	if err := cfg.setFeatureListOptions(logger); err != nil {
 		fmt.Fprintln(os.Stderr, fmt.Errorf("Error parsing feature list: %w", err))
