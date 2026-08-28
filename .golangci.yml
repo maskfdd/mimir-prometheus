@@ -54,7 +54,7 @@ linters:
       - linters:
           - errcheck
         # Taken from the default exclusions in v1.
-        text: Error return value of .((os\.)?std(out|err)\..*|.*Close|.*Flush|os\.Remove(All)?|.*print(f|ln)?|os\.(Un)?Setenv). is not checked
+        text: Error return value of .((os\.)?std(out|err)\..*|.*close|.*Close|.*Flush|os\.Remove(All)?|.*print(f|ln)?|os\.(Un)?Setenv). is not checked
       - linters:
           - govet
         # We use many Seek methods that do not follow the usual pattern.
@@ -87,7 +87,9 @@ linters:
             - pkg: "github.com/stretchr/testify/assert"
               desc: "Use github.com/stretchr/testify/require instead of github.com/stretchr/testify/assert"
             - pkg: "github.com/go-kit/kit/log"
-              desc: "Use github.com/go-kit/log instead of github.com/go-kit/kit/log"
+              desc: "Use log/slog instead of github.com/go-kit/kit/log"
+            - pkg: "github.com/go-kit/log"
+              desc: "Use log/slog instead of github.com/go-kit/log"
             - pkg: "io/ioutil"
               desc: "Use corresponding 'os' or 'io' functions instead."
             - pkg: "regexp"
@@ -131,16 +133,12 @@ linters:
         - hexLiteral
         - hugeParam
         - importShadow
-        - nestingReduce
         - ptrToRefParam
-        - preferStringWriter
         - rangeValCopy
-        - redundantSprint
         - regexpSimplify
         - returnAfterHttpError
         - sloppyReassign
         - sprintfQuotedString
-        - stringsCompare
         - todoCommentWithoutDetail
         - tooManyResultsChecker
         - typeUnparen
@@ -179,10 +177,13 @@ linters:
       # Disable optimization of concat loop.
       concat-loop: false
     revive:
+      enable-all-rules: false
+      enable-default-rules: true
+      max-open-files: 2048
       # By default, revive will enable only the linting rules that are named in the configuration file.
       # So, it's needed to explicitly enable all required rules here.
+      # https://github.com/mgechev/revive/blob/master/RULES_DESCRIPTIONS.md
       rules:
-        # https://github.com/mgechev/revive/blob/master/RULES_DESCRIPTIONS.md
         - name: blank-imports
         - name: comment-spacings
         - name: context-as-argument
@@ -217,6 +218,7 @@ linters:
           arguments:
             - "preserveScope"
         - name: time-naming
+        - name: unnecessary-format
         - name: unexported-return
         - name: unreachable-code
         - name: unused-parameter

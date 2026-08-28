@@ -49,6 +49,7 @@ type Group struct {
 	queryOffset           *time.Duration
 	limit                 int
 	rules                 []Rule
+	sourceTenants         []string
 	seriesInPreviousEval  []map[string]labels.Labels // One per Rule.
 	staleSeries           []labels.Labels
 	opts                  *ManagerOptions
@@ -73,7 +74,10 @@ type Group struct {
 	// defaults to DefaultEvalIterationFunc.
 	evalIterationFunc GroupEvalIterationFunc
 
-	appOpts *storage.AppendOptions
+	operatorControllableErrorClassifier OperatorControllableErrorClassifier
+
+	appOpts                       *storage.AppendOptions
+	alignEvaluationTimeOnInterval bool
 }
 
 // GroupEvalIterationFunc is used to implement and extend rule group
@@ -84,15 +88,17 @@ type Group struct {
 type GroupEvalIterationFunc func(ctx context.Context, g *Group, evalTimestamp time.Time)
 
 type GroupOptions struct {
-	Name, File        string
-	Interval          time.Duration
-	Limit             int
-	Rules             []Rule
-	ShouldRestore     bool
-	Opts              *ManagerOptions
-	QueryOffset       *time.Duration
-	done              chan struct{}
-	EvalIterationFunc GroupEvalIterationFunc
+	Name, File                    string
+	Interval                      time.Duration
+	Limit                         int
+	Rules                         []Rule
+	SourceTenants                 []string
+	ShouldRestore                 bool
+	Opts                          *ManagerOptions
+	QueryOffset                   *time.Duration
+	done                          chan struct{}
+	EvalIterationFunc             GroupEvalIterationFunc
+	AlignEvaluationTimeOnInterval bool
 }
 
 // NewGroup makes a new Group with the given name, options, and rules.
@@ -110,7 +116,8 @@ func NewGroup(o GroupOptions) *Group {
 	metrics.IterationsMissed.WithLabelValues(key)
 	metrics.IterationsScheduled.WithLabelValues(key)
 	metrics.EvalTotal.WithLabelValues(key)
-	metrics.EvalFailures.WithLabelValues(key)
+	metrics.EvalFailures.WithLabelValues(key, "user")
+	metrics.EvalFailures.WithLabelValues(key, "operator")
 	metrics.GroupLastEvalTime.WithLabelValues(key)
 	metrics.GroupLastDuration.WithLabelValues(key)
 	metrics.GroupLastRuleDurationSum.WithLabelValues(key)
@@ -128,22 +135,25 @@ func NewGroup(o GroupOptions) *Group {
 	}
 
 	return &Group{
-		name:                 o.Name,
-		file:                 o.File,
-		interval:             o.Interval,
-		queryOffset:          o.QueryOffset,
-		limit:                o.Limit,
-		rules:                o.Rules,
-		shouldRestore:        o.ShouldRestore,
-		opts:                 opts,
-		seriesInPreviousEval: make([]map[string]labels.Labels, len(o.Rules)),
-		done:                 make(chan struct{}),
-		managerDone:          o.done,
-		terminated:           make(chan struct{}),
-		logger:               opts.Logger.With("file", o.File, "group", o.Name),
-		metrics:              metrics,
-		evalIterationFunc:    evalIterationFunc,
-		appOpts:              &storage.AppendOptions{DiscardOutOfOrder: true},
+		name:                                o.Name,
+		file:                                o.File,
+		interval:                            o.Interval,
+		queryOffset:                         o.QueryOffset,
+		limit:                               o.Limit,
+		rules:                               o.Rules,
+		shouldRestore:                       o.ShouldRestore,
+		opts:                                opts,
+		sourceTenants:                       o.SourceTenants,
+		seriesInPreviousEval:                make([]map[string]labels.Labels, len(o.Rules)),
+		done:                                make(chan struct{}),
+		managerDone:                         o.done,
+		terminated:                          make(chan struct{}),
+		logger:                              opts.Logger.With("file", o.File, "group", o.Name),
+		metrics:                             metrics,
+		evalIterationFunc:                   evalIterationFunc,
+		appOpts:                             &storage.AppendOptions{DiscardOutOfOrder: true},
+		alignEvaluationTimeOnInterval:       o.AlignEvaluationTimeOnInterval,
+		operatorControllableErrorClassifier: opts.OperatorControllableErrorClassifier,
 	}
 }
 
@@ -202,6 +212,10 @@ func (g *Group) Interval() time.Duration { return g.interval }
 
 // Limit returns the group's limit.
 func (g *Group) Limit() int { return g.limit }
+
+// SourceTenants returns the source tenants for the group.
+// If it's empty or nil, then the owning user/tenant is considered to be the source tenant.
+func (g *Group) SourceTenants() []string { return g.sourceTenants }
 
 func (g *Group) Logger() *slog.Logger { return g.logger }
 
@@ -420,9 +434,11 @@ func (g *Group) setLastEvalTimestamp(ts time.Time) {
 
 // EvalTimestamp returns the immediately preceding consistently slotted evaluation time.
 func (g *Group) EvalTimestamp(startTime int64) time.Time {
-	var (
+	var offset int64
+	if !g.alignEvaluationTimeOnInterval {
 		offset = int64(g.hash() % uint64(g.interval))
-
+	}
+	var (
 		// This group's evaluation times differ from the perfect time intervals by `offset` nanoseconds.
 		// But we can only use `% interval` to align with the interval. And `% interval` will always
 		// align with the perfect time intervals, instead of this group's. Because of this we add
@@ -513,7 +529,12 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 		logger := g.logger.With("name", rule.Name(), "index", i)
 		ctx, sp := otel.Tracer("").Start(ctx, "rule")
-		sp.SetAttributes(attribute.String("name", rule.Name()))
+		sp.SetAttributes(
+			attribute.String("group", g.Name()),
+			attribute.String("name", rule.Name()),
+			attribute.Stringer("query_offset", ruleQueryOffset),
+			attribute.Int("index", i),
+		)
 		defer func(t time.Time) {
 			sp.End()
 
@@ -535,12 +556,11 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			rule.SetHealth(HealthBad)
 			rule.SetLastError(err)
 			sp.SetStatus(codes.Error, err.Error())
-			g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+			g.incrementEvalFailures(err)
 
 			// Canceled queries are intentional termination of queries. This normally
 			// happens on shutdown and thus we skip logging of any errors here.
-			var eqc promql.ErrQueryCanceled
-			if !errors.As(err, &eqc) {
+			if _, ok := errors.AsType[promql.ErrQueryCanceled](err); !ok {
 				logger.Warn("Evaluating rule failed", "rule", rule, "err", err)
 			}
 			return
@@ -548,6 +568,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 		rule.SetHealth(HealthGood)
 		rule.SetLastError(nil)
 		samplesTotal.Add(float64(len(vector)))
+		sp.SetAttributes(attribute.Int("num_series", len(vector)))
 
 		if ar, ok := rule.(*AlertingRule); ok {
 			ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
@@ -558,20 +579,37 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			numDuplicates = 0
 		)
 
+		// The appender can block on storage and for simple queries it can
+		// be the majority of trace duration. Trace it using dedicated span
+		// so it's clear from the trace where did all the duration go.
+		_, appenderSp := otel.Tracer("").Start(ctx, "newAppender")
 		app := g.opts.Appendable.Appender(ctx)
+		appenderSp.End()
 		seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
 		defer func() {
-			if err := app.Commit(); err != nil {
+			_, commitSp := otel.Tracer("").Start(ctx, "ruleCommit")
+			err := app.Commit()
+			if err != nil {
+				commitSp.RecordError(err)
+				commitSp.SetStatus(codes.Error, err.Error())
+			}
+			commitSp.End()
+			if err != nil {
 				rule.SetHealth(HealthBad)
 				rule.SetLastError(err)
 				sp.SetStatus(codes.Error, err.Error())
-				g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+				g.incrementEvalFailures(err)
 
 				logger.Warn("Rule sample appending failed", "err", err)
 				return
 			}
 			g.seriesInPreviousEval[i] = seriesReturned
 		}()
+
+		// Trace the time to write the evaluation result samples into the
+		// appender. This span ends before the commit span starts.
+		_, appendSp := otel.Tracer("").Start(ctx, "ruleAppendResults")
+		defer appendSp.End()
 
 		for _, s := range vector {
 			if s.H != nil {
@@ -688,6 +726,14 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 	g.metrics.GroupSamples.WithLabelValues(GroupKey(g.File(), g.Name())).Set(samplesTotal.Load())
 	g.cleanupStaleSeries(ctx, ts)
+}
+
+func (g *Group) incrementEvalFailures(err error) {
+	reason := "user"
+	if g.operatorControllableErrorClassifier != nil && g.operatorControllableErrorClassifier.IsOperatorControllable(err) {
+		reason = "operator"
+	}
+	g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name()), reason).Inc()
 }
 
 func (g *Group) QueryOffset() time.Duration {
@@ -892,9 +938,35 @@ func (g *Group) Equals(ng *Group) bool {
 		return false
 	}
 
+	if g.alignEvaluationTimeOnInterval != ng.alignEvaluationTimeOnInterval {
+		return false
+	}
+
 	for i, gr := range g.rules {
 		if gr.String() != ng.rules[i].String() {
 			return false
+		}
+	}
+	{
+		// compare source tenants
+		if len(g.sourceTenants) != len(ng.sourceTenants) {
+			return false
+		}
+
+		copyAndSort := func(x []string) []string {
+			copied := make([]string, len(x))
+			copy(copied, x)
+			slices.Sort(copied)
+			return copied
+		}
+
+		ngSourceTenantsCopy := copyAndSort(ng.sourceTenants)
+		gSourceTenantsCopy := copyAndSort(g.sourceTenants)
+
+		for i := range ngSourceTenantsCopy {
+			if gSourceTenantsCopy[i] != ngSourceTenantsCopy[i] {
+				return false
+			}
 		}
 	}
 
@@ -938,7 +1010,8 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 				Name:       "rule_evaluation_duration_seconds",
 				Help:       "The duration for a rule to execute.",
 				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
-			}),
+			},
+		),
 		EvalDurationHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace:                       namespace,
 			Name:                            "rule_evaluation_duration_histogram_seconds",
@@ -993,7 +1066,7 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 				Name:      "rule_evaluation_failures_total",
 				Help:      "The total number of rule evaluation failures.",
 			},
-			[]string{"rule_group"},
+			[]string{"rule_group", "reason"},
 		),
 		GroupInterval: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{

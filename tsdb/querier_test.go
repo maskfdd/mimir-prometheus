@@ -410,6 +410,46 @@ func TestBlockQuerier(t *testing.T) {
 				),
 			}),
 		},
+		{
+			// This tests query sharding. The label sets involved both hash into this test's result set. The test
+			// following this is companion to this test (same test but with a different ShardIndex) and should find that
+			// the label sets involved do not hash to that test's result set.
+			mint:  math.MinInt64,
+			maxt:  math.MaxInt64,
+			hints: &storage.SelectHints{Start: math.MinInt64, End: math.MaxInt64, ShardIndex: 0, ShardCount: 2},
+			ms:    []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, "a", ".*")},
+			exp: newMockSeriesSet([]storage.Series{
+				storage.NewListSeries(labels.FromStrings("a", "a"),
+					[]chunks.Sample{sample{0, 1, 2, nil, nil}, sample{0, 2, 3, nil, nil}, sample{0, 3, 4, nil, nil}, sample{0, 5, 2, nil, nil}, sample{0, 6, 3, nil, nil}, sample{0, 7, 4, nil, nil}},
+				),
+				storage.NewListSeries(labels.FromStrings("a", "a", "b", "b"),
+					[]chunks.Sample{sample{0, 1, 1, nil, nil}, sample{0, 2, 2, nil, nil}, sample{0, 3, 3, nil, nil}, sample{0, 5, 3, nil, nil}, sample{0, 6, 6, nil, nil}},
+				),
+				storage.NewListSeries(labels.FromStrings("b", "b"),
+					[]chunks.Sample{sample{0, 1, 3, nil, nil}, sample{0, 2, 2, nil, nil}, sample{0, 3, 6, nil, nil}, sample{0, 5, 1, nil, nil}, sample{0, 6, 7, nil, nil}, sample{0, 7, 2, nil, nil}},
+				),
+			}),
+			expChks: newMockChunkSeriesSet([]storage.ChunkSeries{
+				storage.NewListChunkSeriesFromSamples(labels.FromStrings("a", "a"),
+					[]chunks.Sample{sample{0, 1, 2, nil, nil}, sample{0, 2, 3, nil, nil}, sample{0, 3, 4, nil, nil}}, []chunks.Sample{sample{0, 5, 2, nil, nil}, sample{0, 6, 3, nil, nil}, sample{0, 7, 4, nil, nil}},
+				),
+				storage.NewListChunkSeriesFromSamples(labels.FromStrings("a", "a", "b", "b"),
+					[]chunks.Sample{sample{0, 1, 1, nil, nil}, sample{0, 2, 2, nil, nil}, sample{0, 3, 3, nil, nil}}, []chunks.Sample{sample{0, 5, 3, nil, nil}, sample{0, 6, 6, nil, nil}},
+				),
+				storage.NewListChunkSeriesFromSamples(labels.FromStrings("b", "b"),
+					[]chunks.Sample{sample{0, 1, 3, nil, nil}, sample{0, 2, 2, nil, nil}, sample{0, 3, 6, nil, nil}}, []chunks.Sample{sample{0, 5, 1, nil, nil}, sample{0, 6, 7, nil, nil}, sample{0, 7, 2, nil, nil}},
+				),
+			}),
+		},
+		{
+			// This is a companion to the test above.
+			mint:    math.MinInt64,
+			maxt:    math.MaxInt64,
+			hints:   &storage.SelectHints{Start: math.MinInt64, End: math.MaxInt64, ShardIndex: 1, ShardCount: 2},
+			ms:      []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, "a", ".*")},
+			exp:     newMockSeriesSet([]storage.Series{}),
+			expChks: newMockChunkSeriesSet([]storage.ChunkSeries{}),
+		},
 	} {
 		t.Run("", func(t *testing.T) {
 			ir, cr, _, _ := createIdxChkReaders(t, testData)
@@ -2328,16 +2368,13 @@ func (mockChunkReader) Close() error {
 }
 
 func TestDeletedIterator(t *testing.T) {
-	chk := chunkenc.NewXORChunk()
-	app, err := chk.Appender()
-	require.NoError(t, err)
 	// Insert random stuff from (0, 1000).
-	act := make([]sample, 1000)
+	act := make([]chunks.Sample, 1000)
 	for i := range 1000 {
-		act[i].t = int64(i)
-		act[i].f = rand.Float64()
-		app.Append(0, act[i].t, act[i].f)
+		act[i] = sample{st: int64(i / 2), t: int64(i), f: rand.Float64()}
 	}
+	meta, err := chunks.ChunkFromSamples(act)
+	require.NoError(t, err)
 
 	cases := []struct {
 		r tombstones.Intervals
@@ -2356,7 +2393,7 @@ func TestDeletedIterator(t *testing.T) {
 
 	for _, c := range cases {
 		i := int64(-1)
-		it := &DeletedIterator{Iter: chk.Iterator(nil), Intervals: c.r[:]}
+		it := &DeletedIterator{Iter: meta.Chunk.Iterator(nil), Intervals: c.r[:]}
 		ranges := c.r[:]
 		for it.Next() == chunkenc.ValFloat {
 			i++
@@ -2370,8 +2407,9 @@ func TestDeletedIterator(t *testing.T) {
 			require.Less(t, i, int64(1000))
 
 			ts, v := it.At()
-			require.Equal(t, act[i].t, ts)
-			require.Equal(t, act[i].f, v)
+			require.Equal(t, act[i].T(), ts)
+			require.Equal(t, act[i].F(), v)
+			require.Equal(t, act[i].ST(), it.AtST())
 		}
 		// There has been an extra call to Next().
 		i++
@@ -2592,6 +2630,27 @@ func (m mockIndex) PostingsForAllLabelValues(ctx context.Context, name string) i
 	return index.Merge(ctx, res...)
 }
 
+func (m mockIndex) PostingsForMatchers(_ context.Context, _ bool, ms ...*labels.Matcher) (index.Postings, error) {
+	var ps []storage.SeriesRef
+	for p, s := range m.series {
+		if matches(ms, s.l) {
+			ps = append(ps, p)
+		}
+	}
+	slices.Sort(ps)
+	return index.NewListPostings(ps), nil
+}
+
+func matches(ms []*labels.Matcher, lbls labels.Labels) bool {
+	lm := lbls.Map()
+	for _, m := range ms {
+		if !m.Matches(lm[m.Name]) {
+			return false
+		}
+	}
+	return true
+}
+
 func (m mockIndex) ShardedPostings(p index.Postings, shardIndex, shardCount uint64) index.Postings {
 	out := make([]storage.SeriesRef, 0, 128)
 
@@ -2611,6 +2670,14 @@ func (m mockIndex) ShardedPostings(p index.Postings, shardIndex, shardCount uint
 	}
 
 	return index.NewListPostings(out)
+}
+
+func (mockIndex) LabelValuesFor(index.Postings, string) storage.LabelValues {
+	return storage.ErrLabelValues(errors.New("not implemented"))
+}
+
+func (mockIndex) LabelValuesExcluding(index.Postings, string) storage.LabelValues {
+	return storage.ErrLabelValues(errors.New("not implemented"))
 }
 
 func (m mockIndex) Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
@@ -2652,6 +2719,10 @@ func (m mockIndex) LabelNames(_ context.Context, matchers ...*labels.Matcher) ([
 	}
 	sort.Strings(l)
 	return l, nil
+}
+
+func (mockIndex) IndexLookupPlanner() index.LookupPlanner {
+	return &index.ScanEmptyMatchersLookupPlanner{}
 }
 
 func BenchmarkQueryIterator(b *testing.B) {
@@ -3583,6 +3654,10 @@ func (mockMatcherIndex) PostingsForAllLabelValues(context.Context, string) index
 	return index.ErrPostings(errors.New("PostingsForAllLabelValues called"))
 }
 
+func (mockMatcherIndex) IndexLookupPlanner() index.LookupPlanner {
+	return &index.ScanEmptyMatchersLookupPlanner{}
+}
+
 func TestPostingsForMatcher(t *testing.T) {
 	ctx := context.Background()
 
@@ -3881,6 +3956,136 @@ func TestQueryWithDeletedHistograms(t *testing.T) {
 	}
 }
 
+func TestPrependPostings(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		p := newPrependPostings(nil, index.NewListPostings(nil))
+		require.False(t, p.Next())
+	})
+
+	t.Run("next+At", func(t *testing.T) {
+		p := newPrependPostings([]storage.SeriesRef{10, 20, 30}, index.NewListPostings([]storage.SeriesRef{200, 300, 500}))
+
+		for _, s := range []storage.SeriesRef{10, 20, 30, 200, 300, 500} {
+			require.True(t, p.Next())
+			require.Equal(t, s, p.At())
+			require.Equal(t, s, p.At()) // Multiple calls return same value.
+		}
+		require.False(t, p.Next())
+	})
+
+	t.Run("seek+At", func(t *testing.T) {
+		p := newPrependPostings([]storage.SeriesRef{10, 20, 30}, index.NewListPostings([]storage.SeriesRef{200, 300, 500}))
+
+		require.True(t, p.Seek(5))
+		require.Equal(t, storage.SeriesRef(10), p.At())
+		require.Equal(t, storage.SeriesRef(10), p.At())
+
+		require.True(t, p.Seek(15))
+		require.Equal(t, storage.SeriesRef(20), p.At())
+		require.Equal(t, storage.SeriesRef(20), p.At())
+
+		require.True(t, p.Seek(20)) // Seeking to "current" value doesn't move postings iterator.
+		require.Equal(t, storage.SeriesRef(20), p.At())
+		require.Equal(t, storage.SeriesRef(20), p.At())
+
+		require.True(t, p.Seek(50))
+		require.Equal(t, storage.SeriesRef(200), p.At())
+		require.Equal(t, storage.SeriesRef(200), p.At())
+
+		require.False(t, p.Seek(1000))
+		require.False(t, p.Next())
+	})
+
+	t.Run("err", func(t *testing.T) {
+		err := errors.New("error")
+		p := newPrependPostings([]storage.SeriesRef{10, 20, 30}, index.ErrPostings(err))
+
+		for _, s := range []storage.SeriesRef{10, 20, 30} {
+			require.True(t, p.Next())
+			require.Equal(t, s, p.At())
+			require.NoError(t, p.Err())
+		}
+		// Advancing after prepended values returns false, and gives us access to error.
+		require.False(t, p.Next())
+		require.Equal(t, err, p.Err())
+	})
+}
+
+func TestLabelsValuesWithMatchersOptimization(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultHeadOptions()
+	opts.ChunkRange = 1000
+	opts.ChunkDirRoot = dir
+	h, err := NewHead(nil, nil, nil, nil, opts, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, h.Close())
+	}()
+
+	ctx := context.Background()
+
+	app := h.Appender(ctx)
+	addSeries := func(l labels.Labels) {
+		app.Append(0, l, 0, 0)
+	}
+
+	const maxI = 10 * maxExpandedPostingsFactor
+
+	allValuesOfI := make([]string, 0, maxI)
+	for i := range maxI {
+		allValuesOfI = append(allValuesOfI, strconv.Itoa(i))
+	}
+
+	for n := range 10 {
+		for i := range maxI {
+			addSeries(labels.FromStrings("i", allValuesOfI[i], "n", strconv.Itoa(n), "j", "foo", "i_times_n", strconv.Itoa(i*n)))
+		}
+	}
+	require.NoError(t, app.Commit())
+
+	ir, err := h.Index()
+	require.NoError(t, err)
+
+	primesTimes := labels.MustNewMatcher(labels.MatchEqual, "i_times_n", "23") // It will match single i*n combination (n < 10)
+	nonPrimesTimes := labels.MustNewMatcher(labels.MatchEqual, "i_times_n", "20")
+	n3 := labels.MustNewMatcher(labels.MatchEqual, "n", "3")
+
+	cases := []struct {
+		name            string
+		labelName       string
+		matchers        []*labels.Matcher
+		expectedResults []string
+	}{
+		{name: `i with i_times_n=23`, labelName: "i", matchers: []*labels.Matcher{primesTimes}, expectedResults: []string{"23"}},
+		{name: `i with i_times_n=20`, labelName: "i", matchers: []*labels.Matcher{nonPrimesTimes}, expectedResults: []string{"4", "5", "10", "20"}},
+		{name: `n with n="3"`, labelName: "i", matchers: []*labels.Matcher{n3}, expectedResults: allValuesOfI},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cir := &indexReaderCountingPostingsForMatchersCalls{IndexReader: ir}
+			values, err := labelValuesWithMatchers(ctx, cir, c.labelName, nil, c.matchers...)
+			require.NoError(t, err)
+			require.ElementsMatch(t, c.expectedResults, values)
+			require.Equal(t, 1, cir.postingsForMatchersCalls,
+				"expected PostingsForMatchers to be called once. "+
+					"labelValuesWithMatchers should call the IndexReader.PostingsForMatchers instead of calling the package function PostingsForMatchers "+
+					"because IndexReader may use the cached version of the PostingsForMatchers",
+			)
+		})
+	}
+}
+
+type indexReaderCountingPostingsForMatchersCalls struct {
+	IndexReader
+	postingsForMatchersCalls int
+}
+
+func (f *indexReaderCountingPostingsForMatchersCalls) PostingsForMatchers(ctx context.Context, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
+	f.postingsForMatchersCalls++
+	return f.IndexReader.PostingsForMatchers(ctx, concurrent, ms...)
+}
+
 func TestQueryWithOneChunkCompletelyDeleted(t *testing.T) {
 	ctx := context.Background()
 	db := newTestDB(t)
@@ -3952,6 +4157,137 @@ func TestQueryWithOneChunkCompletelyDeleted(t *testing.T) {
 	require.Equal(t, 1, seriesCount)
 }
 
+// TestChunkQuerier_OverlappingInOrderAndOOOChunks verifies the chunks
+// returned by the ChunkQuerier when an in-order chunk overlaps with many
+// out-of-order chunks. All sample timestamps are distinct. The total
+// number of samples is chosen to exceed math.MaxUint16 so that the
+// querier must split the merged iterable into multiple output chunks.
+func TestChunkQuerier_OverlappingInOrderAndOOOChunks(t *testing.T) {
+	for _, storeST := range []bool{false, true} {
+		t.Run(fmt.Sprintf("store-st=%v", storeST), func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				valType chunkenc.ValueType
+			}{
+				{"float", chunkenc.ValFloat},
+				{"histogram", chunkenc.ValHistogram},
+				{"float histogram", chunkenc.ValFloatHistogram},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					testChunkQuerierOverlappingInOrderAndOOOChunks(t, tc.valType, storeST)
+				})
+			}
+		})
+	}
+}
+
+func testChunkQuerierOverlappingInOrderAndOOOChunks(t *testing.T, valType chunkenc.ValueType, storeST bool) {
+	const (
+		oooCapMax = 32
+		// Pick more OOO samples than any chunk encoding can hold so the
+		// querier is forced to cut the merged iterable into multiple chunks.
+		oooSamplesToAppend = int(math.MaxUint16) + 10
+		firstIndex         = 0                      // Position of in-order sample at the start.
+		lastIndex          = oooSamplesToAppend + 1 // Position of in-order sample at the end to overlap all OOO samples.
+	)
+
+	opts := DefaultOptions()
+	opts.OutOfOrderCapMax = oooCapMax
+	opts.OutOfOrderTimeWindow = 24 * time.Hour.Milliseconds()
+	opts.EnableSTStorage = storeST
+	if storeST {
+		opts.FloatChunkEncoding = chunkenc.EncXOR2
+	}
+	db := newTestDB(t, withOpts(opts))
+	db.DisableCompactions()
+
+	lbls := labels.FromStrings("foo", "bar")
+
+	appendSample := func(app storage.Appender, ts int64) error {
+		switch valType {
+		case chunkenc.ValFloat:
+			_, err := app.Append(0, lbls, ts, float64(ts))
+			return err
+		case chunkenc.ValHistogram:
+			_, err := app.AppendHistogram(0, lbls, ts, tsdbutil.GenerateTestHistogram(ts), nil)
+			return err
+		case chunkenc.ValFloatHistogram:
+			_, err := app.AppendHistogram(0, lbls, ts, nil, tsdbutil.GenerateTestFloatHistogram(ts))
+			return err
+		default:
+			return fmt.Errorf("unsupported value type: %v", valType)
+		}
+	}
+
+	// Append the two in-order samples at the start and end of the range,
+	// so that the in-order chunk spans the full range that the OOO samples
+	// will land in.
+	app := db.Appender(context.Background())
+	for _, i := range []int{firstIndex, lastIndex} {
+		require.NoError(t, appendSample(app, int64(10000+i*10)))
+	}
+	require.NoError(t, app.Commit())
+
+	// Sanity check: the two in-order samples form a single in-memory head
+	// chunk covering the whole timestamp range, with no m-mapped chunks.
+	ms, _, err := db.head.getOrCreate(lbls.Hash(), lbls, false)
+	require.NoError(t, err)
+	require.NotNil(t, ms.headChunks)
+	require.Equal(t, 1, ms.headChunks.len())
+	require.Nil(t, ms.headChunks.prev)
+	require.Empty(t, ms.mmappedChunks)
+	require.Equal(t, int64(10000+firstIndex*10), ms.headChunks.minTime)
+	require.Equal(t, int64(10000+lastIndex*10), ms.headChunks.maxTime)
+	require.Equal(t, 2, ms.headChunks.chunk.NumSamples())
+
+	// Append the OOO samples in the gap between the two in-order samples.
+	app = db.Appender(context.Background())
+	for i := firstIndex + 1; i < lastIndex; i++ {
+		require.NoError(t, appendSample(app, int64(10000+i*10)))
+	}
+	require.NoError(t, app.Commit())
+
+	// Sanity check: the head holds the expected number of OOO chunks for
+	// the series. Each m-mapped OOO chunk has oooCapMax samples; whatever
+	// remains lives in the in-memory head OOO chunk.
+	require.NotNil(t, ms.ooo)
+	require.Len(t, ms.ooo.oooMmappedChunks, oooSamplesToAppend/oooCapMax)
+	require.Equal(t, oooSamplesToAppend%oooCapMax, ms.ooo.oooHeadChunk.chunk.NumSamples())
+
+	chunkQuerier, err := db.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+
+	matcher := labels.MustNewMatcher(labels.MatchEqual, "foo", "bar")
+	css := chunkQuerier.Select(context.Background(), false, nil, matcher)
+
+	var seriesCount, chunkCount, sampleCount int
+	lastTS := int64(math.MinInt64)
+	for css.Next() {
+		seriesCount++
+		series := css.At()
+		it := series.Iterator(nil)
+		for it.Next() {
+			chunkCount++
+			chk := it.At()
+			cit := chk.Chunk.Iterator(nil)
+			for vt := cit.Next(); vt != chunkenc.ValNone; vt = cit.Next() {
+				require.Equal(t, valType, vt)
+				ts := cit.AtT()
+				require.Greater(t, ts, lastTS, "timestamps must be strictly increasing across the returned chunks")
+				lastTS = ts
+				sampleCount++
+			}
+			require.NoError(t, cit.Err())
+		}
+		require.NoError(t, it.Err())
+	}
+	require.NoError(t, css.Err())
+
+	require.Equal(t, 1, seriesCount)
+	require.Greater(t, chunkCount, 1)
+	require.Equal(t, lastIndex-firstIndex+1, sampleCount)
+}
+
 func TestReader_PostingsForLabelMatchingHonorsContextCancel(t *testing.T) {
 	ir := mockReaderOfLabels{}
 
@@ -4013,6 +4349,22 @@ func (mockReaderOfLabels) Series(storage.SeriesRef, *labels.ScratchBuilder, *[]c
 
 func (mockReaderOfLabels) Symbols() index.StringIter {
 	panic("Series called")
+}
+
+func (mockReaderOfLabels) IndexLookupPlanner() index.LookupPlanner {
+	return &index.ScanEmptyMatchersLookupPlanner{}
+}
+
+func (mockReaderOfLabels) LabelValuesExcluding(index.Postings, string) storage.LabelValues {
+	panic("LabelValuesExcluding called")
+}
+
+func (mockReaderOfLabels) LabelValuesFor(index.Postings, string) storage.LabelValues {
+	panic("LabelValuesFor called")
+}
+
+func (mockReaderOfLabels) PostingsForMatchers(context.Context, bool, ...*labels.Matcher) (index.Postings, error) {
+	panic("PostingsForMatchers called")
 }
 
 // TestMergeQuerierConcurrentSelectMatchers reproduces the data race bug from

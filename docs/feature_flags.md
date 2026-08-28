@@ -42,7 +42,13 @@ When enabled, for each instance scrape, Prometheus stores a sample in the follow
 `--enable-feature=promql-per-step-stats`
 
 When enabled, passing `stats=all` in a query request returns per-step
-statistics. Currently this is limited to totalQueryableSamples.
+statistics. The following sample statistics are included:
+
+- **totalQueryableSamples** / **totalQueryableSamplesPerStep**: Total number of samples *loaded* during the query. For range-vector functions (e.g. `rate`, `sum_over_time`) evaluated over multiple steps, each step counts the full window (the same point may be counted in multiple steps).
+- **samplesRead** / **samplesReadPerStep**: Total number of samples *read* (I/O). For range-vector functions in range queries, only *new* points per step are counted (step 0: full window; later steps: points not seen in the previous step). For other query types, this equals totalQueryableSamples.
+- **peakSamples**: Peak number of samples in memory during evaluation (used for the `query.max-samples` limit).
+
+The Prometheus server exposes two counters for observability: `prometheus_engine_query_samples_total` (samples loaded, full window per step) and `prometheus_engine_query_samples_read_total` (samples read, delta per step for range-vector).
 
 When disabled in either the engine or the query, per-step statistics are not
 computed at all.
@@ -96,16 +102,30 @@ Besides enabling this feature in Prometheus, start timestamps need to be exposed
 
 > NOTE: This is an experimental feature with known limitations until fully implemented.
 > * It introduces new WAL record type (SamplesV2) that can only be replayed with Prometheus 3.11 or later versions.
-> * For persistent storage support (TSDB blocks), you need to manually opt-in for XOR2 chunk format ([`xor2-encoding` flag](#xor2-chunk-encoding)). 
-> This might change later once we finish experimentation phase with XOR2.
-> * ST for native histograms and NHCBs are not yet implemented (see [#18315](https://github.com/prometheus/prometheus/issues/18315)).
+> * For persistent storage support (TSDB blocks), this feature automatically enables the XOR2 chunk format for floats and the histogram ST chunk formats for native histograms. These are the same formats enabled independently through [`chunk_encoding.floats: xor2`](configuration/configuration.md#tsdb) and the [`histograms-st-encoding`](#histogram-st-chunk-encoding) flag.
+>   Explicitly setting `chunk_encoding.floats: xor` in the config file while `st-storage` is active is rejected at config reload because XOR chunks do not store start timestamps.
+>   These constraints might change later once we finish the experimentation phase.
+> * Other areas of ST support for native histograms and NHCBs are still in progress (see [#18315](https://github.com/prometheus/prometheus/issues/18315)).
 > * PromQL use of ST is out of scope of this feature.
 
 ## Start timestamp (ST) usage in PromQL functions
 
 `--enable-feature=use-start-timestamps`
 
-Enables the use of start timestamps (ST) in PromQL functions such as `rate()`, `irate()`, and `increase()`. This feature doesn't currently work with extended range selectors (`promql-extended-range-selectors`). 
+Enables the use of start timestamps (ST) in PromQL functions such as `rate()`, `irate()`, `increase()` and `start_timestamp()`. This feature doesn't currently work with extended range selectors (`promql-extended-range-selectors`). 
+
+## Start timestamp (ST) synthesis
+
+`--enable-feature=st-synthesis`
+
+Enables the synthesis of start timestamps (ST) for cumulative metrics (Counters, Classic Histograms, Native Histograms) when they are not provided by the source. Similar to [the official OpenTelemetry metricstarttimeprocessor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/metricstarttimeprocessor#strategy-subtract-initial-point), it tracks previous values to detect resets and subtracts the initial reference point to synthesize a zero-based timeline from the first sample.
+
+> NOTE: This is an experimental feature.
+> * The first sample is dropped when this feature is turned on to establish the start timestamp reference point. As a result, if a series has only a single point reported, turning this feature on may result in no points being ingested for that series.
+> * Synthesis yields accurate Start Timestamp while maintaining accurate counter rates. However, the raw counter values will be different that what's scraped. This is because the first point is dropped and its timestamp is used as the start timestamp for all subsequent points. All subsequent points are normalized against that dropped point (i.e. subtracted by it). Effectively, synthesis create new counter streams with the known start timestamp from the original data.
+> * Synthesis works only with scraped data (RW and Otel receiver are not implemented).
+> * Synthesis requires ordered samples. As a result, cumulative samples without ST that are out of order will be rejected despite the `tsdb. out_of_order_time_window` setting.
+> * If an append fails for a series (e.g., due to out-of-order samples being rejected), the synthesis state for that series is cleared. As a result, the next sample received after the failure will be treated as the first sample again and will be dropped to establish a new reference point.
 
 ## Concurrent evaluation of independent rules
 
@@ -117,7 +137,7 @@ reason to run them sequentially.
 When the `concurrent-rule-eval` feature flag is enabled, rules without any dependency on other rules within a rule group will be evaluated concurrently.
 This has the potential to improve rule group evaluation latency and resource utilization at the expense of adding more concurrent query load.
 
-The number of concurrent rule evaluations can be configured with `--rules.max-concurrent-rule-evals`, which is set to `4` by default.
+The number of concurrent rule evaluations can be configured with `--rules.max-concurrent-evals`, which is set to `4` by default.
 
 ## Serve old Prometheus UI
 
@@ -170,19 +190,6 @@ fixes the possible problem with the feature flag.)
 
 It is possible to craft a query that aggregates by `__name__` and puts samples with and without delayed name removal into the same group. In that case, the name is removed from the affected group. Note that this case hardly occurs in queries that fulfill a practical purpose.
 
-## Auto Reload Config
-
-`--enable-feature=auto-reload-config`
-
-When enabled, Prometheus will automatically reload its configuration file at a
-specified interval. The interval is defined by the
-`--config.auto-reload-interval` flag, which defaults to `30s`.
-
-Configuration reloads are triggered by detecting changes in the checksum of the
-main configuration file or any referenced files, such as rule and scrape
-configurations. To ensure consistency and avoid issues during reloads, it's
-recommended to update these files atomically.
-
 ## OTLP Delta Conversion
 
 `--enable-feature=otlp-deltatocumulative`
@@ -204,63 +211,6 @@ Enabling this _can_ have negative impact on performance, because the in-memory
 state is mutex guarded. Cumulative-only OTLP requests are not affected.
 
 [d2c]: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/deltatocumulativeprocessor
-
-## PromQL arithmetic expressions in time durations
-
-`--enable-feature=promql-duration-expr`
-
-With this flag, arithmetic expressions can be used in time durations in range queries and offset durations.
-
-In range queries:
-```
-rate(http_requests_total[5m * 2])  # 10 minute range
-rate(http_requests_total[(5+2) * 1m])  # 7 minute range
-```
-
-In offset durations:
-```
-http_requests_total offset (1h / 2)  # 30 minute offset
-http_requests_total offset ((2 ^ 3) * 1m)  # 8 minute offset
-```
-
-When using offset with duration expressions, you must wrap the expression in
-parentheses. Without parentheses, only the first duration value will be used in
-the offset calculation.
-
-`step()` can be used in duration expressions.
-For a **range query**, it resolves to the step width of the range query.
-For an **instant query**, it resolves to `0s`.
-
-`range()` can be used in duration expressions.
-For a **range query**, it resolves to the full range of the query (end time - start time).
-For an **instant query**, it resolves to `0s`.
-This is particularly useful in combination with `@end()` to look back over the entire query range, e.g., `max_over_time(metric[range()] @ end())`.
-
-`min(<duration>, <duration>)` and `max(<duration>, <duration>)` can be used to find the minimum or maximum of two duration expressions.
-
-**Note**: Duration expressions are not supported in the @ timestamp operator.
-
-The following operators are supported:
-
-* `+` - addition
-* `-` - subtraction
-* `*` - multiplication
-* `/` - division
-* `%` - modulo
-* `^` - exponentiation
-
-Examples of equivalent durations:
-
-* `5m * 2` is equivalent to `10m` or `600s`
-* `10m - 1m` is equivalent to `9m` or `540s`
-* `(5+2) * 1m` is equivalent to `7m` or `420s`
-* `1h / 2` is equivalent to `30m` or `1800s`
-* `4h % 3h` is equivalent to `1h` or `3600s`
-* `(2 ^ 3) * 1m` is equivalent to `8m` or `480s`
-* `step() + 1` is equivalent to the query step width increased by 1s.
-* `max(step(), 5s)` is equivalent to the larger of the query step width and `5s`.
-* `min(2 * step() + 5s, 5m)` is equivalent to the smaller of twice the query step increased by `5s` and `5m`.
-
 
 ## OTLP Native Delta Support
 
@@ -340,12 +290,22 @@ For more details, see the [proposal](https://github.com/prometheus/proposals/pul
 
 `--enable-feature=xor2-encoding`
 
-> WARNING: This is highly experimental and risky setting:
-> * Chunks encoded with XOR2 **cannot be read by older Prometheus versions** that do not support the encoding. Once enabled and data is written, you need to **manually delete blocks from the disk**, otherwise Prometheus will return error on all queries.
-> * We are still experimenting on the final encoding. As of now this encoding can change in any Prometheus version. All your persistent block data will be lost between versions.
-> * This is encoding is new, meaning downstream tools and LTS systems might now support it yet (e.g. Thanos sidecar uploaded blocks).
+> **Note:** This feature flag is deprecated. The XOR2 float chunk encoding is stable; select it with the `chunk_encoding.floats` field in the `storage.tsdb` section of the configuration file instead, documented in the [configuration documentation](configuration/configuration.md#tsdb). The flag only sets the default float chunk encoding to `xor2`, and will become a no-op in a future major version.
 
-This setting enables the new XOR2 chunk encoding for float samples, which provides better disk compression than the default XOR encoding for typical Prometheus workloads. This format also allow storing Start Timestamp (ST).
+The [`st-storage`](#start-timestamp-st-native-storage) feature also selects XOR2 as the default float chunk encoding because XOR chunks cannot store start timestamps.
+
+## Histogram ST chunk encoding
+
+`--enable-feature=histograms-st-encoding`
+
+> WARNING: This is highly experimental and risky setting:
+> * Chunks encoded with `histogramST` and `floathistogramST` **cannot be read by older Prometheus versions** that do not support the encoding. Once enabled and data is written, you need to **manually delete blocks from the disk**, otherwise Prometheus will return error on all queries.
+> * We are still experimenting on the final encoding. As of now this encoding can change in any Prometheus version. All your persistent block data will be lost between versions.
+> * This encoding is new, meaning downstream tools and LTS systems might not support it yet (e.g. Thanos sidecar uploaded blocks).
+
+This setting enables the new `histogramST` and `floathistogramST` chunk encodings for native histogram and float histogram samples. These encodings extend the corresponding histogram chunk formats with a Start Timestamp (ST) header and per-sample ST encoding, equivalent to what the [XOR2 encoding](configuration/configuration.md#tsdb) does for float chunks. The flag does not affect float chunks.
+
+The [`st-storage`](#start-timestamp-st-native-storage) feature automatically enables these histogram encodings. When enabled without `st-storage`, Prometheus uses the ST-capable histogram chunk encodings but does not store start timestamps from ingestion.
 
 ## Extended Range Selectors
 
@@ -401,3 +361,42 @@ Example query:
 ```
 
 See [the fill modifiers documentation](querying/operators.md#filling-in-missing-matches) for more details and examples.
+
+
+## Search API
+
+`--enable-feature=search-api`
+
+Enables the experimental search API endpoints for discovering metric names,
+label names, and label values with fuzzy matching and filtering support. See
+[the search API documentation](querying/api.md#searching-metric-names-label-names-and-label-values)
+for details.
+
+The `--web.search.max-limit` flag (default `10000`) bounds the `limit` query
+parameter accepted by the search endpoints. Requests with a higher `limit` are
+rejected with HTTP 400. The default response limit (100) is silently clamped
+to this maximum, so an operator setting a smaller cap does not break
+no-`limit` requests. Setting the flag to `0` disables the cap entirely; this
+is **not recommended** for endpoints exposed beyond a trusted network because a
+single client can then request the entire index in one response.
+
+## OpenMetrics 2.0
+
+`--enable-feature=openmetrics2`
+
+Enables scraping targets that expose the [OpenMetrics 2.0](https://prometheus.io/docs/specs/om/open_metrics_spec_2_0/)
+text format, advertised with the `application/openmetrics-text; version=2.0.0`
+content type.
+
+OpenMetrics 2.0 support is **experimental**. The parser is not stable
+yet, so expositions that Prometheus accepts today may be rejected by a later release.
+Do not depend on the current behavior in production.
+
+When this flag is disabled, an OpenMetrics 2.0 content type is treated as an
+unsupported content type: the target's `fallback_scrape_protocol` is used if
+one is configured, and the scrape fails otherwise.
+
+If you are implementing an OpenMetrics 2.0 exporter or client library, note that
+a successful scrape by Prometheus is **not** a certification that your output is
+spec-compliant. Refer to [OpenMetrics 2.0 migration guide](https://prometheus.io/docs/guides/open_metrics_2_0_migration/)
+instead. 

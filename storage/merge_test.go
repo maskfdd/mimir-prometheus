@@ -387,13 +387,13 @@ func TestMergeChunkQuerierWithNoVerticalChunkSeriesMerger(t *testing.T) {
 func histogramSample(ts int64, hint histogram.CounterResetHint) hSample {
 	h := tsdbutil.GenerateTestHistogram(ts + 1)
 	h.CounterResetHint = hint
-	return hSample{st: -ts, t: ts, h: h}
+	return hSample{st: 0, t: ts, h: h}
 }
 
 func floatHistogramSample(ts int64, hint histogram.CounterResetHint) fhSample {
 	fh := tsdbutil.GenerateTestFloatHistogram(ts + 1)
 	fh.CounterResetHint = hint
-	return fhSample{st: -ts, t: ts, fh: fh}
+	return fhSample{st: 0, t: ts, fh: fh}
 }
 
 // Shorthands for counter reset hints.
@@ -448,6 +448,14 @@ func TestCompactingChunkSeriesMerger(t *testing.T) {
 			input: []ChunkSeries{
 				NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}, []chunks.Sample{fSample{0, 3, 3}, fSample{0, 5, 5}}),
 				NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 7, 7}, fSample{0, 9, 9}}, []chunks.Sample{fSample{0, 10, 10}}),
+			},
+			expected: NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}, []chunks.Sample{fSample{0, 3, 3}, fSample{0, 5, 5}}, []chunks.Sample{fSample{0, 7, 7}, fSample{0, 9, 9}}, []chunks.Sample{fSample{0, 10, 10}}),
+		},
+		{
+			name: "two non overlapping in reverse order",
+			input: []ChunkSeries{
+				NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 7, 7}, fSample{0, 9, 9}}, []chunks.Sample{fSample{0, 10, 10}}),
+				NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}, []chunks.Sample{fSample{0, 3, 3}, fSample{0, 5, 5}}),
 			},
 			expected: NewListChunkSeriesFromSamples(labels.FromStrings("bar", "baz"), []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}, []chunks.Sample{fSample{0, 3, 3}, fSample{0, 5, 5}}, []chunks.Sample{fSample{0, 7, 7}, fSample{0, 9, 9}}, []chunks.Sample{fSample{0, 10, 10}}),
 		},
@@ -594,11 +602,94 @@ func TestCompactingChunkSeriesMerger(t *testing.T) {
 			require.Equal(t, expErr, actErr)
 			require.Equal(t, expChks, actChks)
 
+			count, err := merged.ChunkCount()
+			require.NoError(t, err)
+			require.Len(t, actChks, count)
 			actSamples := chunks.ChunkMetasToSamples(actChks)
 			expSamples := chunks.ChunkMetasToSamples(expChks)
 			require.Equal(t, expSamples, actSamples)
 		})
 	}
+}
+
+func TestCompactingChunkSeriesMergerFloatEncoding(t *testing.T) {
+	lbls := labels.FromStrings("bar", "baz")
+
+	// Two series with overlapping XOR chunks, forcing a re-encode on merge.
+	overlappingInput := func() []ChunkSeries {
+		return []ChunkSeries{
+			NewListChunkSeriesFromSamples(lbls, []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}),
+			NewListChunkSeriesFromSamples(lbls, []chunks.Sample{fSample{0, 2, 2}, fSample{0, 3, 3}}),
+		}
+	}
+
+	expandChunks := func(t *testing.T, m VerticalChunkSeriesMergeFunc, input []ChunkSeries) []chunks.Meta {
+		t.Helper()
+		merged := m(input...)
+		require.Equal(t, lbls, merged.Labels())
+		actChks, err := ExpandChunks(merged.Iterator(nil))
+		require.NoError(t, err)
+		return actChks
+	}
+
+	t.Run("nil getter keeps XOR for re-encoded chunks", func(t *testing.T) {
+		m := NewCompactingChunkSeriesMergerWithFloatEncoding(ChainedSeriesMerge, nil)
+		actChks := expandChunks(t, m, overlappingInput())
+		require.Len(t, actChks, 1)
+		require.Equal(t, chunkenc.EncXOR, actChks[0].Chunk.Encoding())
+		require.Equal(t, 3, actChks[0].Chunk.NumSamples())
+	})
+
+	t.Run("XOR2 getter re-encodes overlapping chunks to XOR2", func(t *testing.T) {
+		m := NewCompactingChunkSeriesMergerWithFloatEncoding(ChainedSeriesMerge, func() chunkenc.Encoding { return chunkenc.EncXOR2 })
+		actChks := expandChunks(t, m, overlappingInput())
+		require.Len(t, actChks, 1)
+		require.Equal(t, chunkenc.EncXOR2, actChks[0].Chunk.Encoding())
+		require.Equal(t, 3, actChks[0].Chunk.NumSamples())
+		actSamples, err := ExpandSamples(actChks[0].Chunk.Iterator(nil), nil)
+		require.NoError(t, err)
+		require.Equal(t, []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}, fSample{0, 3, 3}}, actSamples)
+	})
+
+	t.Run("non-overlapping chunks pass through with source encoding", func(t *testing.T) {
+		m := NewCompactingChunkSeriesMergerWithFloatEncoding(ChainedSeriesMerge, func() chunkenc.Encoding { return chunkenc.EncXOR2 })
+		input := []ChunkSeries{
+			NewListChunkSeriesFromSamples(lbls, []chunks.Sample{fSample{0, 1, 1}, fSample{0, 2, 2}}),
+			NewListChunkSeriesFromSamples(lbls, []chunks.Sample{fSample{0, 3, 3}, fSample{0, 4, 4}}),
+		}
+		actChks := expandChunks(t, m, input)
+		require.Len(t, actChks, 2)
+		require.Equal(t, chunkenc.EncXOR, actChks[0].Chunk.Encoding())
+		require.Equal(t, chunkenc.EncXOR, actChks[1].Chunk.Encoding())
+	})
+
+	t.Run("getter is read again for each merged series", func(t *testing.T) {
+		enc := chunkenc.EncXOR
+		m := NewCompactingChunkSeriesMergerWithFloatEncoding(ChainedSeriesMerge, func() chunkenc.Encoding { return enc })
+
+		actChks := expandChunks(t, m, overlappingInput())
+		require.Len(t, actChks, 1)
+		require.Equal(t, chunkenc.EncXOR, actChks[0].Chunk.Encoding())
+
+		enc = chunkenc.EncXOR2
+		actChks = expandChunks(t, m, overlappingInput())
+		require.Len(t, actChks, 1)
+		require.Equal(t, chunkenc.EncXOR2, actChks[0].Chunk.Encoding())
+	})
+
+	t.Run("150 overlapping samples split at 120 with XOR2", func(t *testing.T) {
+		m := NewCompactingChunkSeriesMergerWithFloatEncoding(ChainedSeriesMerge, func() chunkenc.Encoding { return chunkenc.EncXOR2 })
+		input := []ChunkSeries{
+			NewListChunkSeriesFromSamples(lbls, chunks.GenerateSamples(0, 90)),  // [0 - 90).
+			NewListChunkSeriesFromSamples(lbls, chunks.GenerateSamples(60, 90)), // [60 - 150).
+		}
+		actChks := expandChunks(t, m, input)
+		require.Len(t, actChks, 2)
+		require.Equal(t, chunkenc.EncXOR2, actChks[0].Chunk.Encoding())
+		require.Equal(t, 120, actChks[0].Chunk.NumSamples())
+		require.Equal(t, chunkenc.EncXOR2, actChks[1].Chunk.Encoding())
+		require.Equal(t, 30, actChks[1].Chunk.NumSamples())
+	})
 }
 
 func TestCompactingChunkSeriesMergerHistogramCounterResetHint(t *testing.T) {
@@ -848,6 +939,10 @@ func TestConcatenatingChunkSeriesMerger(t *testing.T) {
 
 			require.Equal(t, expErr, actErr)
 			require.Equal(t, expChks, actChks)
+
+			count, err := merged.ChunkCount()
+			require.NoError(t, err)
+			require.Len(t, expChks, count)
 		})
 	}
 }
@@ -1757,41 +1852,12 @@ type partialErrSearchQuerier struct {
 }
 
 func (q *partialErrSearchQuerier) SearchLabelNames(_ context.Context, _ *SearchHints, _ ...*labels.Matcher) SearchResultSet {
-	return newErrAfterResultsSet(q.names, q.err)
+	return NewSearchResultSetFromSliceAndError(q.names, nil, q.err)
 }
 
 func (q *partialErrSearchQuerier) SearchLabelValues(_ context.Context, _ string, _ *SearchHints, _ ...*labels.Matcher) SearchResultSet {
-	return newErrAfterResultsSet(q.values, q.err)
+	return NewSearchResultSetFromSliceAndError(q.values, nil, q.err)
 }
-
-// errAfterResultsSet is a SearchResultSet that yields results then returns an error.
-type errAfterResultsSet struct {
-	results []SearchResult
-	idx     int // starts at -1; incremented by Next.
-	err     error
-}
-
-func newErrAfterResultsSet(results []SearchResult, err error) *errAfterResultsSet {
-	return &errAfterResultsSet{results: results, err: err, idx: -1}
-}
-
-func (s *errAfterResultsSet) Next() bool {
-	s.idx++
-	return s.idx < len(s.results)
-}
-
-func (s *errAfterResultsSet) At() SearchResult { return s.results[s.idx] }
-
-func (*errAfterResultsSet) Warnings() annotations.Annotations { return nil }
-
-func (s *errAfterResultsSet) Err() error {
-	if s.idx >= len(s.results) {
-		return s.err
-	}
-	return nil
-}
-
-func (*errAfterResultsSet) Close() error { return nil }
 
 func collectSearchResults(t *testing.T, rs SearchResultSet) []SearchResult {
 	t.Helper()
@@ -1916,8 +1982,9 @@ func TestMergeQuerierSearch(t *testing.T) {
 		// the caller closes before exhaustion. This cannot be tested
 		// through the public API because the error-to-warning conversion
 		// only fires on exhaustion.
-		inner := newErrAfterResultsSet(
+		inner := NewSearchResultSetFromSliceAndError(
 			[]SearchResult{{Value: "zone", Score: 0.5}},
+			nil,
 			errors.New("early close failure"),
 		)
 		rs := warningsOnErrorSearchResultSet(inner)
@@ -1959,7 +2026,7 @@ func TestMergeQuerierSearch(t *testing.T) {
 		}
 		q2 := &mockQuerier{resp: []string{"should_be_ignored"}}
 		// Verify precondition: mockQuerier does not implement Searcher.
-		_, isSearcher := (Querier)(q2).(Searcher)
+		_, isSearcher := Querier(q2).(Searcher)
 		require.False(t, isSearcher)
 		merged := newMerged(q1, q2)
 		defer merged.Close()
@@ -1974,7 +2041,7 @@ func TestMergeQuerierSearch(t *testing.T) {
 		q1 := &mockQuerier{resp: []string{"a", "b"}}
 		q2 := &mockQuerier{resp: []string{"c", "d"}}
 		// Verify precondition.
-		_, isSearcher := (Querier)(q1).(Searcher)
+		_, isSearcher := Querier(q1).(Searcher)
 		require.False(t, isSearcher)
 		merged := newMerged(q1, q2)
 		defer merged.Close()
@@ -2051,7 +2118,7 @@ func TestMergeQuerierSearch(t *testing.T) {
 		}, got)
 	})
 
-	t.Run("primary error preserves warnings from prior searchers", func(t *testing.T) {
+	t.Run("primary error preserves prior results and warnings", func(t *testing.T) {
 		var ws annotations.Annotations
 		ws.Add(errors.New("prior warning"))
 		q1 := &searchQuerier{
@@ -2063,7 +2130,11 @@ func TestMergeQuerierSearch(t *testing.T) {
 		defer merged.Close()
 
 		rs := merged.(Searcher).SearchLabelNames(ctx, nil)
-		// Iteration should see no results because the merge errored.
+		// The successful searcher's results must come through even though
+		// the other primary failed; only after the surviving side exhausts
+		// does iteration end.
+		require.True(t, rs.Next())
+		require.Equal(t, SearchResult{Value: "env", Score: 1.0}, rs.At())
 		require.False(t, rs.Next())
 		require.Error(t, rs.Err())
 		require.Contains(t, rs.Err().Error(), "primary failure")
@@ -2071,6 +2142,29 @@ func TestMergeQuerierSearch(t *testing.T) {
 		warnings := rs.Warnings().AsErrors()
 		require.Len(t, warnings, 1)
 		require.Contains(t, warnings[0].Error(), "prior warning")
+		require.NoError(t, rs.Close())
+	})
+
+	t.Run("partial primary failure mid-stream keeps surviving values", func(t *testing.T) {
+		// q1 yields two values then errors; q2 yields one value cleanly.
+		q1 := &partialErrSearchQuerier{
+			names: []SearchResult{{Value: "alpha", Score: 1.0}, {Value: "beta", Score: 1.0}},
+			err:   errors.New("a tail error"),
+		}
+		q2 := &searchQuerier{
+			names: []SearchResult{{Value: "delta", Score: 1.0}},
+		}
+		merged := NewMergeQuerier([]Querier{q1, q2}, nil, ChainedSeriesMerge)
+		defer merged.Close()
+
+		rs := merged.(Searcher).SearchLabelNames(ctx, nil)
+		var got []string
+		for rs.Next() {
+			got = append(got, rs.At().Value)
+		}
+		require.Equal(t, []string{"alpha", "beta", "delta"}, got)
+		require.Error(t, rs.Err())
+		require.Contains(t, rs.Err().Error(), "a tail error")
 		require.NoError(t, rs.Close())
 	})
 

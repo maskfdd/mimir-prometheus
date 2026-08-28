@@ -25,6 +25,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -43,11 +44,13 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
+	"github.com/prometheus/prometheus/util/stats"
 	"github.com/prometheus/prometheus/util/teststorage"
 	prom_testutil "github.com/prometheus/prometheus/util/testutil"
 )
@@ -845,6 +848,168 @@ func TestUpdate(t *testing.T) {
 		}
 	}
 	reloadAndValidate(rgs, t, tmpFile, ruleManager, ogs)
+
+	// Change group source tenants and reload.
+	for i := range rgs.Groups {
+		rgs.Groups[i].SourceTenants = []string{"tenant-2"}
+	}
+	reloadAndValidate(rgs, t, tmpFile, ruleManager, ogs)
+}
+
+func TestUpdateSetsSourceTenants(t *testing.T) {
+	st := teststorage.New(t)
+	defer st.Close()
+
+	opts := promql.EngineOpts{
+		Logger:     nil,
+		Reg:        nil,
+		MaxSamples: 10,
+		Timeout:    10 * time.Second,
+	}
+	engine := promql.NewEngine(opts)
+	ruleManager := NewManager(&ManagerOptions{
+		Appendable: st,
+		Queryable:  st,
+		QueryFunc:  EngineQueryFunc(engine, st),
+		Context:    context.Background(),
+		Logger:     promslog.NewNopLogger(),
+	})
+	ruleManager.start()
+	defer ruleManager.Stop()
+
+	rgs, errs := rulefmt.ParseFile("fixtures/rules_with_source_tenants.yaml", false, model.UTF8Validation, testParser, promslog.NewNopLogger())
+	require.Empty(t, errs, "file parsing failures")
+
+	tmpFile, err := os.CreateTemp("", "rules.test.*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	reloadRules(rgs, t, tmpFile, ruleManager, 0)
+
+	// check that all source tenants were actually set
+	require.Len(t, ruleManager.groups, len(rgs.Groups))
+
+	for _, expectedGroup := range rgs.Groups {
+		actualGroup, ok := ruleManager.groups[GroupKey(tmpFile.Name(), expectedGroup.Name)]
+
+		require.True(t, ok, "actual groups don't contain at one of the expected groups")
+		require.ElementsMatch(t, expectedGroup.SourceTenants, actualGroup.SourceTenants())
+	}
+}
+
+func TestAlignEvaluationTimeOnInterval(t *testing.T) {
+	st := teststorage.New(t)
+	defer st.Close()
+
+	opts := promql.EngineOpts{
+		Logger:     nil,
+		Reg:        nil,
+		MaxSamples: 10,
+		Timeout:    10 * time.Second,
+	}
+	engine := promql.NewEngine(opts)
+	ruleManager := NewManager(&ManagerOptions{
+		Appendable: st,
+		Queryable:  st,
+		QueryFunc:  EngineQueryFunc(engine, st),
+		Context:    context.Background(),
+		Logger:     promslog.NewNopLogger(),
+	})
+	ruleManager.start()
+	defer ruleManager.Stop()
+
+	rgs, errs := rulefmt.ParseFile("fixtures/rules_with_alignment.yaml", false, model.UTF8Validation, testParser, promslog.NewNopLogger())
+	require.Empty(t, errs, "file parsing failures")
+
+	tmpFile, err := os.CreateTemp("", "rules.test.*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	reloadRules(rgs, t, tmpFile, ruleManager, 0)
+
+	// Verify that all groups are loaded, and let's check their evaluation times.
+	loadedGroups := ruleManager.RuleGroups()
+	require.Len(t, loadedGroups, len(rgs.Groups))
+
+	assertGroupEvalTimeAlignedOnIntervalIsHonored := func(groupName string, expectedAligned bool) {
+		g := (*Group)(nil)
+		for _, lg := range loadedGroups {
+			if lg.name == groupName {
+				g = lg
+				break
+			}
+		}
+		require.NotNil(t, g, "group not found: %s", groupName)
+
+		// When "g.hash() % g.interval == 0" alignment cannot be checked, because aligned and unaligned eval timestamps
+		// would be the same. This can happen because g.hash() depends on path passed to ruleManager.Update function,
+		// and this test uses temporary directory for storing rule group files.
+		if g.hash()%uint64(g.interval) == 0 {
+			t.Skip("skipping test, because rule group hash is divisible by interval, which makes eval timestamp always aligned to the interval")
+		}
+
+		now := time.Now()
+		ts := g.EvalTimestamp(now.UnixNano())
+
+		aligned := ts.UnixNano()%g.interval.Nanoseconds() == 0
+		require.Equal(t, expectedAligned, aligned, "group: %s, hash: %d, now: %d", groupName, g.hash(), now.UnixNano())
+	}
+
+	assertGroupEvalTimeAlignedOnIntervalIsHonored("aligned", true)
+	assertGroupEvalTimeAlignedOnIntervalIsHonored("aligned_with_crazy_interval", true)
+	assertGroupEvalTimeAlignedOnIntervalIsHonored("unaligned_default", false)
+	assertGroupEvalTimeAlignedOnIntervalIsHonored("unaligned_explicit", false)
+}
+
+func TestGroupEvaluationContextFuncIsCalledWhenSupplied(t *testing.T) {
+	type testContextKeyType string
+	var testContextKey testContextKeyType = "TestGroupEvaluationContextFuncIsCalledWhenSupplied"
+	oldContextTestValue := context.Background().Value(testContextKey)
+
+	contextTestValueChannel := make(chan any)
+	mockQueryFunc := func(ctx context.Context, _ string, _ time.Time) (promql.Vector, error) {
+		contextTestValueChannel <- ctx.Value(testContextKey)
+		return promql.Vector{}, nil
+	}
+
+	mockContextWrapFunc := func(ctx context.Context, _ *Group) context.Context {
+		return context.WithValue(ctx, testContextKey, 42)
+	}
+
+	st := teststorage.New(t)
+	defer st.Close()
+
+	ruleManager := NewManager(&ManagerOptions{
+		Appendable:                 st,
+		Queryable:                  st,
+		QueryFunc:                  mockQueryFunc,
+		Context:                    context.Background(),
+		Logger:                     promslog.NewNopLogger(),
+		GroupEvaluationContextFunc: mockContextWrapFunc,
+	})
+
+	rgs, errs := rulefmt.ParseFile("fixtures/rules_with_source_tenants.yaml", false, model.UTF8Validation, testParser, promslog.NewNopLogger())
+	require.Empty(t, errs, "file parsing failures")
+
+	tmpFile, err := os.CreateTemp("", "rules.test.*.yaml")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// no filesystem is harmed when running this test, set the interval low
+	reloadRules(rgs, t, tmpFile, ruleManager, 10*time.Millisecond)
+
+	ruleManager.start()
+	defer ruleManager.Stop()
+
+	// check that all source tenants were actually set
+	require.Len(t, ruleManager.groups, len(rgs.Groups))
+
+	require.Nil(t, oldContextTestValue, "Context contained test key before the test, impossible")
+	newContextTestValue := <-contextTestValueChannel
+	require.Equal(t, 42, newContextTestValue, "Context does not contain the correct value that should be injected")
 }
 
 // ruleGroupsTest for running tests over rules.
@@ -854,11 +1019,13 @@ type ruleGroupsTest struct {
 
 // ruleGroupTest forms a testing struct for running tests over rules.
 type ruleGroupTest struct {
-	Name     string            `yaml:"name"`
-	Interval model.Duration    `yaml:"interval,omitempty"`
-	Limit    int               `yaml:"limit,omitempty"`
-	Rules    []rulefmt.Rule    `yaml:"rules"`
-	Labels   map[string]string `yaml:"labels,omitempty"`
+	Name                          string            `yaml:"name"`
+	Interval                      model.Duration    `yaml:"interval,omitempty"`
+	Limit                         int               `yaml:"limit,omitempty"`
+	Rules                         []rulefmt.Rule    `yaml:"rules"`
+	Labels                        map[string]string `yaml:"labels,omitempty"`
+	SourceTenants                 []string          `yaml:"source_tenants,omitempty"`
+	AlignEvaluationTimeOnInterval bool              `yaml:"align_evaluation_time_on_interval,omitempty"`
 }
 
 func formatRules(r *rulefmt.RuleGroups) ruleGroupsTest {
@@ -877,11 +1044,13 @@ func formatRules(r *rulefmt.RuleGroups) ruleGroupsTest {
 			})
 		}
 		tmp = append(tmp, ruleGroupTest{
-			Name:     g.Name,
-			Interval: g.Interval,
-			Limit:    g.Limit,
-			Rules:    rtmp,
-			Labels:   g.Labels,
+			Name:                          g.Name,
+			Interval:                      g.Interval,
+			Limit:                         g.Limit,
+			Rules:                         rtmp,
+			Labels:                        g.Labels,
+			SourceTenants:                 g.SourceTenants,
+			AlignEvaluationTimeOnInterval: g.AlignEvaluationTimeOnInterval,
 		})
 	}
 	return ruleGroupsTest{
@@ -889,14 +1058,22 @@ func formatRules(r *rulefmt.RuleGroups) ruleGroupsTest {
 	}
 }
 
-func reloadAndValidate(rgs *rulefmt.RuleGroups, t *testing.T, tmpFile *os.File, ruleManager *Manager, ogs map[string]*Group) {
+func reloadRules(rgs *rulefmt.RuleGroups, t *testing.T, tmpFile *os.File, ruleManager *Manager, interval time.Duration) {
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+
 	bs, err := yaml.Marshal(formatRules(rgs))
 	require.NoError(t, err)
-	tmpFile.Seek(0, 0)
+	_, _ = tmpFile.Seek(0, 0)
 	_, err = tmpFile.Write(bs)
 	require.NoError(t, err)
-	err = ruleManager.Update(10*time.Second, []string{tmpFile.Name()}, labels.EmptyLabels(), "", nil)
+	err = ruleManager.Update(interval, []string{tmpFile.Name()}, labels.EmptyLabels(), "", nil)
 	require.NoError(t, err)
+}
+
+func reloadAndValidate(rgs *rulefmt.RuleGroups, t *testing.T, tmpFile *os.File, ruleManager *Manager, ogs map[string]*Group) {
+	reloadRules(rgs, t, tmpFile, ruleManager, 0)
 	for h, g := range ruleManager.groups {
 		if ogs[h] == g {
 			t.Fail()
@@ -976,6 +1153,7 @@ func TestMetricsUpdate(t *testing.T) {
 		"prometheus_rule_evaluation_failures_total",
 		"prometheus_rule_group_interval_seconds",
 		"prometheus_rule_group_last_duration_seconds",
+		"prometheus_rule_group_last_rule_duration_sum_seconds",
 		"prometheus_rule_group_last_evaluation_timestamp_seconds",
 		"prometheus_rule_group_rules",
 	}
@@ -1020,11 +1198,11 @@ func TestMetricsUpdate(t *testing.T) {
 	}{
 		{
 			files:   files,
-			metrics: 12,
+			metrics: 16,
 		},
 		{
 			files:   files[:1],
-			metrics: 6,
+			metrics: 8,
 		},
 		{
 			files:   files[:0],
@@ -1032,7 +1210,7 @@ func TestMetricsUpdate(t *testing.T) {
 		},
 		{
 			files:   files[1:],
-			metrics: 6,
+			metrics: 8,
 		},
 	}
 
@@ -1518,6 +1696,24 @@ func TestNativeHistogramsInRecordingRules(t *testing.T) {
 	require.Equal(t, chunkenc.ValNone, it.Next())
 }
 
+// TestManager_LoadGroups_WithoutLogger covers the nil pointer dereference in the
+// default GroupLoader. ManagerOptions.Logger is optional, but NewManager used to
+// build FileLoader before substituting a no-op logger for a nil one, so the loader
+// kept the nil and panicked on the first rule file it had to warn about.
+func TestManager_LoadGroups_WithoutLogger(t *testing.T) {
+	ruleManager := NewManager(&ManagerOptions{})
+
+	var (
+		groups map[string]*Group
+		errs   []error
+	)
+	require.NotPanics(t, func() {
+		groups, errs = ruleManager.LoadGroups(time.Second, labels.EmptyLabels(), "", nil, false, "fixtures/rules_multi_doc.yaml")
+	})
+	require.Empty(t, errs)
+	require.Len(t, groups, 1)
+}
+
 func TestManager_LoadGroups_ShouldCheckWhetherEachRuleHasDependentsAndDependencies(t *testing.T) {
 	storage := teststorage.New(t)
 
@@ -1946,10 +2142,16 @@ func TestDependentRulesWithNonMetricExpression(t *testing.T) {
 }
 
 func TestDependencyMapUpdatesOnGroupUpdate(t *testing.T) {
+	storage := teststorage.New(t)
+	engine := testEngine(t)
+
 	files := []string{"fixtures/rules.yaml"}
 	ruleManager := NewManager(&ManagerOptions{
-		Context: context.Background(),
-		Logger:  promslog.NewNopLogger(),
+		Appendable: storage,
+		Queryable:  storage,
+		QueryFunc:  EngineQueryFunc(engine, storage),
+		Context:    context.Background(),
+		Logger:     promslog.NewNopLogger(),
 	})
 
 	ruleManager.start()
@@ -2767,3 +2969,113 @@ func BenchmarkRuleDependencyController_AnalyseRules(b *testing.B) {
 		}
 	}
 }
+
+// HTTPStatusOperatorControllableErrorClassifier is a test classifier that identifies
+// 429 and 5xx status codes as operator-controllable errors.
+type HTTPStatusOperatorControllableErrorClassifier struct{}
+
+func (*HTTPStatusOperatorControllableErrorClassifier) IsOperatorControllable(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "429") || strings.Contains(errMsg, "50")
+}
+
+func TestOperatorControllableErrorClassifier(t *testing.T) {
+	storage := teststorage.New(t)
+	t.Cleanup(func() { storage.Close() })
+
+	expr, err := testParser.ParseExpr("up")
+	require.NoError(t, err)
+	rule := NewRecordingRule("test_rule", expr, labels.EmptyLabels())
+
+	customClassifier := &HTTPStatusOperatorControllableErrorClassifier{}
+
+	testCases := []struct {
+		name                       string
+		errorMessage               string
+		classifier                 OperatorControllableErrorClassifier
+		expectOperatorControllable bool
+	}{
+		{"default classifier", "any error", nil, false},
+		{"custom 429 classified as operator controllable", "HTTP 429 Too Many Requests", customClassifier, true},
+		{"custom 500 classified as operator controllable", "HTTP 500 Internal Server Error", customClassifier, true},
+		{"custom 502 classified as operator controllable", "HTTP 502 Bad Gateway", customClassifier, true},
+		{"custom 400 not operator controllable", "HTTP 400 Bad Request", customClassifier, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errorQueryFunc := func(_ context.Context, _ string, _ time.Time) (promql.Vector, error) {
+				return nil, fmt.Errorf("%s", tc.errorMessage)
+			}
+
+			opts := &ManagerOptions{
+				Context:                             context.Background(),
+				QueryFunc:                           errorQueryFunc,
+				Appendable:                          storage,
+				Queryable:                           storage,
+				Logger:                              promslog.NewNopLogger(),
+				OperatorControllableErrorClassifier: tc.classifier,
+			}
+
+			// NewManager will set the default classifier if nil
+			manager := NewManager(opts)
+
+			group := NewGroup(GroupOptions{
+				Name:     "test_group",
+				File:     "test.yml",
+				Interval: time.Second,
+				Rules:    []Rule{rule},
+				Opts:     manager.opts,
+			})
+
+			group.Eval(context.Background(), time.Now())
+
+			groupKey := GroupKey("test.yml", "test_group")
+			evalUserFailures := testutil.ToFloat64(group.metrics.EvalFailures.WithLabelValues(groupKey, "user"))
+			evalOperatorFailures := testutil.ToFloat64(group.metrics.EvalFailures.WithLabelValues(groupKey, "operator"))
+
+			if tc.expectOperatorControllable {
+				require.Equal(t, float64(0), evalUserFailures)
+				require.Equal(t, float64(1), evalOperatorFailures)
+			} else {
+				require.Equal(t, float64(1), evalUserFailures)
+				require.Equal(t, float64(0), evalOperatorFailures)
+			}
+		})
+	}
+}
+
+// TestEngineQueryFunc_ClosesQuery verifies EngineQueryFunc Close()s the
+// promql.Query it creates after every evaluation.
+func TestEngineQueryFunc_ClosesQuery(t *testing.T) {
+	eng := &closeCountingEngine{}
+	qf := EngineQueryFunc(eng, nil)
+
+	_, err := qf(context.Background(), "vector(0)", time.Unix(0, 0))
+	require.NoError(t, err)
+	require.Equal(t, 1, eng.q.closeCalls, "Close must be called exactly once")
+}
+
+type closeCountingEngine struct{ q closeCountingQuery }
+
+func (e *closeCountingEngine) NewInstantQuery(context.Context, storage.Queryable, promql.QueryOpts, string, time.Time) (promql.Query, error) {
+	return &e.q, nil
+}
+
+func (e *closeCountingEngine) NewRangeQuery(context.Context, storage.Queryable, promql.QueryOpts, string, time.Time, time.Time, time.Duration) (promql.Query, error) {
+	return &e.q, nil
+}
+
+type closeCountingQuery struct{ closeCalls int }
+
+func (*closeCountingQuery) Exec(context.Context) *promql.Result {
+	return &promql.Result{Value: promql.Vector{}}
+}
+func (q *closeCountingQuery) Close()                    { q.closeCalls++ }
+func (*closeCountingQuery) Statement() parser.Statement { return nil }
+func (*closeCountingQuery) Stats() *stats.Statistics    { return nil }
+func (*closeCountingQuery) Cancel()                     {}
+func (*closeCountingQuery) String() string              { return "" }

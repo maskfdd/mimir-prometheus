@@ -14,13 +14,18 @@
 package labels
 
 import (
+	"bufio"
 	"fmt"
 	"math/rand"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/DmitriyVTitov/size"
 	"github.com/grafana/regexp"
 	"github.com/grafana/regexp/syntax"
 	"github.com/stretchr/testify/require"
@@ -30,7 +35,9 @@ var (
 	asciiRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 	regexes    = []string{
 		"",
+		"()",
 		"foo",
+		"foo()",
 		"^foo",
 		"(foo|bar)",
 		"foo.*",
@@ -39,7 +46,11 @@ var (
 		"^.+foo$",
 		".?",
 		".*",
+		"().*",
+		".*()",
+		"().*()",
 		".+",
+		".+()",
 		"foo.+",
 		".+foo",
 		"foo\n.+",
@@ -47,6 +58,7 @@ var (
 		".*foo.*",
 		".+foo.+",
 		".*foo.*|",
+		"(?i).*foo.*",
 		".*foo.*|bar.*",
 		"foo.*|.*bar.*",
 		".*foo.*|.*bar.*",
@@ -67,6 +79,8 @@ var (
 		"10\\.0\\.(1|2)\\.+",
 		"10\\.0\\.(1|2).+",
 		"((fo(bar))|.+foo)",
+		"(?i)report.scheduled.job_runscheduledreports",
+		"report.scheduled.job_runscheduledreports",
 		// A long case sensitive alternation.
 		"zQPbMkNO|NNSPdvMi|iWuuSoAl|qbvKMimS|IecrXtPa|seTckYqt|NxnyHkgB|fIDlOgKb|UhlWIygH|OtNoJxHG|cUTkFVIV|mTgFIHjr|jQkoIDtE|PPMKxRXl|AwMfwVkQ|CQyMrTQJ|BzrqxVSi|nTpcWuhF|PertdywG|ZZDgCtXN|WWdDPyyE|uVtNQsKk|BdeCHvPZ|wshRnFlH|aOUIitIp|RxZeCdXT|CFZMslCj|AVBZRDxl|IzIGCnhw|ythYuWiz|oztXVXhl|VbLkwqQx|qvaUgyVC|VawUjPWC|ecloYJuj|boCLTdSU|uPrKeAZx|hrMWLWBq|JOnUNHRM|rYnujkPq|dDEdZhIj|DRrfvugG|yEGfDxVV|YMYdJWuP|PHUQZNWM|AmKNrLis|zTxndVfn|FPsHoJnc|EIulZTua|KlAPhdzg|ScHJJCLt|NtTfMzME|eMCwuFdo|SEpJVJbR|cdhXZeCx|sAVtBwRh|kVFEVcMI|jzJrxraA|tGLHTell|NNWoeSaw|DcOKSetX|UXZAJyka|THpMphDP|rizheevl|kDCBRidd|pCZZRqyu|pSygkitl|SwZGkAaW|wILOrfNX|QkwVOerj|kHOMxPDr|EwOVycJv|AJvtzQFS|yEOjKYYB|LizIINLL|JBRSsfcG|YPiUqqNl|IsdEbvee|MjEpGcBm|OxXZVgEQ|xClXGuxa|UzRCGFEb|buJbvfvA|IPZQxRet|oFYShsMc|oBHffuHO|bzzKrcBR|KAjzrGCl|IPUsAVls|OGMUMbIU|gyDccHuR|bjlalnDd|ZLWjeMna|fdsuIlxQ|dVXtiomV|XxedTjNg|XWMHlNoA|nnyqArQX|opfkWGhb|wYtnhdYb",
 		// An extremely long case sensitive alternation. This is a special
@@ -103,20 +117,43 @@ var (
 		"((.*))(?i:f)((.*))o((.*))o((.*))",
 		"((.*))f((.*))(?i:o)((.*))o((.*))",
 		"(.*0.*)",
+		// Capturing groups directly adjacent to a literal, with no
+		// intervening wildcard (regression test for a false-positive match
+		// against RE2, see #18896).
+		`.*\|(foo)\|.*`,
+		".*-(ab)-.*",
+		// Case-insensitive literal prefixes and suffixes containing runes
+		// whose case folding changes their encoded length: 'k' folds with
+		// 'K' (Kelvin sign, U+212A) and 's' folds with 'ſ' (long s, U+017F).
+		"(?i)k.*",
+		"(?i)k-(a|b)",
+		"(?i)(ka.+|kb.+)",
+		".*(?i:k)",
+		"a.*(?i:sk)",
+		"(?i:some)-pattern.*",
 	}
 	values = []string{
 		"foo", " foo bar", "bar", "buzz\nbar", "bar foo", "bfoo", "\n", "\nfoo", "foo\n", "hello foo world", "hello foo\n world", "",
 		"FOO", "Foo", "fOo", "foO", "OO", "Oo", "\nfoo\n", strings.Repeat("f", 20), "prometheus", "prometheus_api_v1", "prometheus_api_v1_foo",
 		"10.0.1.20", "10.0.2.10", "10.0.3.30", "10.0.4.40",
+		"report.scheduled.job_runscheduledreports", "Report.Scheduled.JobRunScheduledReports", "Report.Scheduled.Job_RunScheduledReports",
 		"foofoo0", "foofoo", "😀foo0", "ſſs", "ſſS", "AAAAAAAAAAAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBBBBBBBBBBB", "cccccccccccccccccccccccC", "ſſſſſſſſſſſſſſſſſſſſſſſſS", "SSSSSSSSSSSSSSSSSSSSSSSSſ",
 		"a-b-c-d-e",
 		"aaaaaa-bbbbbb-cccccc-dddddd-eeeeee",
 		"aaaaaa----eeeeee",
 		"----",
 		"-a-a-a-",
+		"|foo|",
+		"|foo-bar|",
+		"x-ab-y",
+		"x-abc-y",
 
 		// Values matching / not matching the test regexps on long alternations.
 		"zQPbMkNO", "zQPbMkNo", "jyyfj00j0061", "jyyfj00j006", "jyyfj00j00612", "NNSPdvMi", "NNSPdvMiXXX", "NNSPdvMixxx", "nnSPdvMi", "nnSPdvMiXXX",
+
+		// Values with runes whose case folding changes their encoded length.
+		"\u212a", "\u212aa", "\u212ab", "\u212a-a", "\u212a-abc", "\u212aelvin", "abc\u212a", "a\u212a", "axſk", "axs\u212a",
+		"ſome-pattern", "SOME-pattern", "ſk", "kſ",
 
 		// Invalid utf8
 		"\xfefoo",
@@ -144,6 +181,115 @@ func TestFastRegexMatcher_MatchString(t *testing.T) {
 	}
 }
 
+func TestNewFastRegexMatcher_CacheSizeLimit(t *testing.T) {
+	// Start with an empty cache.
+	fastRegexMatcherCache.Clear()
+
+	// Init the random seed with a constant, so that it doesn't change between runs.
+	randGenerator := rand.New(rand.NewSource(1))
+
+	// Generate a very expensive regex.
+	alternates := make([]string, 1000)
+	for i := range alternates {
+		alternates[i] = randString(randGenerator, 100) + fmt.Sprintf(".%d", i)
+	}
+	expensiveRegexp := strings.Join(alternates, "|")
+
+	// Utility function to get a unique expensive regexp.
+	getExpensiveRegexp := func(id int) string {
+		return expensiveRegexp + strconv.Itoa(id)
+	}
+
+	// Estimate the size of the matcher with the expensive regexp.
+	m, err := newFastRegexMatcherWithoutCache(expensiveRegexp)
+	require.NoError(t, err)
+	expensiveRegexpSizeBytes := size.Of(m)
+	t.Logf("expensive regexp estimated size (bytes): %d", expensiveRegexpSizeBytes)
+
+	// Estimate the max number of items in the cache.
+	estimatedMaxItemsInCache := fastRegexMatcherCacheMaxSizeBytes / expensiveRegexpSizeBytes
+
+	// Fill the cache.
+	for i := range estimatedMaxItemsInCache {
+		_, err := NewFastRegexMatcher(getExpensiveRegexp(i))
+		require.NoError(t, err)
+	}
+
+	// Ensure all regexp matchers are still in the cache.
+	fastRegexMatcherCache.Wait()
+
+	for i := range estimatedMaxItemsInCache {
+		_, ok := fastRegexMatcherCache.Get(getExpensiveRegexp(i))
+		require.True(t, ok, "checking if regexp matcher #%d is still in the cache", i)
+	}
+
+	// Add one more regexp matcher to the cache.
+	_, err = NewFastRegexMatcher(getExpensiveRegexp(estimatedMaxItemsInCache + 1))
+	require.NoError(t, err)
+
+	// Ensure one item has been evicted from the cache to make room for the new entry.
+	fastRegexMatcherCache.Wait()
+
+	numEvicted := 0
+	for i := range estimatedMaxItemsInCache {
+		if _, ok := fastRegexMatcherCache.Get(getExpensiveRegexp(i)); !ok {
+			t.Logf("the regexp matcher #%d has been evicted from the cache", i)
+			numEvicted++
+		}
+	}
+
+	require.Equal(t, 1, numEvicted)
+}
+
+func BenchmarkNewFastRegexMatcher(b *testing.B) {
+	runBenchmark := func(newFunc func(v string) (*FastRegexMatcher, error)) func(b *testing.B) {
+		return func(b *testing.B) {
+			for _, r := range regexes {
+				b.Run(getTestNameFromRegexp(r), func(b *testing.B) {
+					for n := 0; n < b.N; n++ {
+						_, err := newFunc(r)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+	}
+
+	b.Run("with cache", runBenchmark(NewFastRegexMatcher))
+	b.Run("without cache", runBenchmark(newFastRegexMatcherWithoutCache))
+}
+
+func BenchmarkNewFastRegexMatcher_CacheMisses(b *testing.B) {
+	// Init the random seed with a constant, so that it doesn't change between runs.
+	randGenerator := rand.New(rand.NewSource(1))
+
+	tests := map[string]string{
+		"simple regexp":  randString(randGenerator, 10),
+		"complex regexp": strings.Join(randStrings(randGenerator, 100, 10), "|"),
+	}
+
+	for testName, regexpPrefix := range tests {
+		b.Run(testName, func(b *testing.B) {
+			// Ensure the cache is empty.
+			fastRegexMatcherCache.Clear()
+
+			b.ResetTimer()
+
+			for n := 0; n < b.N; n++ {
+				// Unique regexp to emulate 100% cache misses.
+				regexp := regexpPrefix + strconv.Itoa(n)
+
+				_, err := NewFastRegexMatcher(regexp)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func readable(s string) string {
 	const maxReadableStringLen = 40
 	if len(s) < maxReadableStringLen {
@@ -154,10 +300,11 @@ func readable(s string) string {
 
 func TestOptimizeConcatRegex(t *testing.T) {
 	cases := []struct {
-		regex    string
-		prefix   string
-		suffix   string
-		contains []string
+		regex                   string
+		prefix                  string
+		isCaseInsensitivePrefix bool
+		suffix                  string
+		contains                []string
 	}{
 		{regex: "foo(hello|bar)", prefix: "foo", suffix: "", contains: nil},
 		{regex: "foo(hello|bar)world", prefix: "foo", suffix: "world", contains: nil},
@@ -171,12 +318,12 @@ func TestOptimizeConcatRegex(t *testing.T) {
 		{regex: ".*[abc].*", prefix: "", suffix: "", contains: nil},
 		{regex: ".*((?i)abc).*", prefix: "", suffix: "", contains: nil},
 		{regex: ".*(?i:abc).*", prefix: "", suffix: "", contains: nil},
-		{regex: "(?i:abc).*", prefix: "", suffix: "", contains: nil},
+		{regex: "(?i:abc).*", prefix: "ABC", isCaseInsensitivePrefix: true, suffix: "", contains: nil},
 		{regex: ".*(?i:abc)", prefix: "", suffix: "", contains: nil},
 		{regex: ".*(?i:abc)def.*", prefix: "", suffix: "", contains: []string{"def"}},
 		{regex: "(?i).*(?-i:abc)def", prefix: "", suffix: "", contains: []string{"abc"}},
 		{regex: ".*(?msU:abc).*", prefix: "", suffix: "", contains: []string{"abc"}},
-		{regex: "[aA]bc.*", prefix: "", suffix: "", contains: []string{"bc"}},
+		{regex: "[aA]bc.*", prefix: "A", isCaseInsensitivePrefix: true, suffix: "", contains: []string{"bc"}},
 		{regex: "^5..$", prefix: "5", suffix: "", contains: nil},
 		{regex: "^release.*", prefix: "release", suffix: "", contains: nil},
 		{regex: "^env-[0-9]+laio[1]?[^0-9].*", prefix: "env-", suffix: "", contains: []string{"laio"}},
@@ -184,13 +331,16 @@ func TestOptimizeConcatRegex(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		parsed, err := syntax.Parse(c.regex, syntax.Perl|syntax.DotNL)
-		require.NoError(t, err)
+		t.Run(c.regex, func(t *testing.T) {
+			parsed, err := syntax.Parse(c.regex, syntax.Perl|syntax.DotNL)
+			require.NoError(t, err)
 
-		prefix, suffix, contains := optimizeConcatRegex(parsed)
-		require.Equal(t, c.prefix, prefix)
-		require.Equal(t, c.suffix, suffix)
-		require.Equal(t, c.contains, contains)
+			caseInsensitivePrefix, prefix, suffix, contains := optimizeConcatRegex(parsed)
+			require.Equal(t, c.prefix, prefix)
+			require.Equal(t, c.isCaseInsensitivePrefix, caseInsensitivePrefix)
+			require.Equal(t, c.suffix, suffix)
+			require.Equal(t, c.contains, contains)
+		})
 	}
 }
 
@@ -267,22 +417,22 @@ func TestFindSetMatches(t *testing.T) {
 			parsed, err := syntax.Parse(c.pattern, syntax.Perl|syntax.DotNL)
 			require.NoError(t, err)
 			matches, actualCaseSensitive := findSetMatches(parsed)
-			require.Equal(t, c.expMatches, matches)
+			require.ElementsMatch(t, c.expMatches, matches)
 			require.Equal(t, c.expCaseSensitive, actualCaseSensitive)
 
 			if c.expCaseSensitive {
 				// When the regexp is case sensitive, we want to ensure that the
 				// set matches are maintained in the final matcher.
-				r, err := NewFastRegexMatcher(c.pattern)
+				r, err := newFastRegexMatcherWithoutCache(c.pattern)
 				require.NoError(t, err)
-				require.Equal(t, c.expMatches, r.SetMatches())
+				require.ElementsMatch(t, c.expMatches, r.SetMatches())
 			}
 		})
 	}
 }
 
 func TestFastRegexMatcher_SetMatches_ShouldReturnACopy(t *testing.T) {
-	m, err := NewFastRegexMatcher("a|b")
+	m, err := newFastRegexMatcherWithoutCache("a|b")
 	require.NoError(t, err)
 	require.Equal(t, []string{"a", "b"}, m.SetMatches())
 
@@ -309,6 +459,7 @@ func BenchmarkFastRegexMatcher(b *testing.B) {
 					_ = m.MatchString(text)
 				}
 			}
+			b.ReportMetric(m.SingleMatchCost(), "cost")
 		})
 	}
 }
@@ -366,6 +517,9 @@ func TestNewFastRegexMatcher(t *testing.T) {
 		exp     StringMatcher
 	}{
 		{".*", trueMatcher{}},
+		{"().*", trueMatcher{}},
+		{".*()", trueMatcher{}},
+		{"().*()", trueMatcher{}},
 		{".*?", trueMatcher{}},
 		{"(?s:.*)", trueMatcher{}},
 		{"(.*)", trueMatcher{}},
@@ -375,20 +529,23 @@ func TestNewFastRegexMatcher(t *testing.T) {
 		{"^.+$", &anyNonEmptyStringMatcher{matchNL: true}},
 		{"(.+)", &anyNonEmptyStringMatcher{matchNL: true}},
 		{"", emptyStringMatcher{}},
+		{"()", emptyStringMatcher{}},
 		{"^$", emptyStringMatcher{}},
 		{"^foo$", &equalStringMatcher{s: "foo", caseSensitive: true}},
+		{"^foo()$", &equalStringMatcher{s: "foo", caseSensitive: true}},
+		{"^()foo$", &equalStringMatcher{s: "foo", caseSensitive: true}},
 		{"^(?i:foo)$", &equalStringMatcher{s: "FOO", caseSensitive: false}},
 		{"^((?i:foo)|(bar))$", orStringMatcher([]StringMatcher{&equalStringMatcher{s: "FOO", caseSensitive: false}, &equalStringMatcher{s: "bar", caseSensitive: true}})},
-		{`(?i:((foo|bar)))`, orStringMatcher([]StringMatcher{&equalStringMatcher{s: "FOO", caseSensitive: false}, &equalStringMatcher{s: "BAR", caseSensitive: false}})},
-		{`(?i:((foo1|foo2|bar)))`, orStringMatcher([]StringMatcher{orStringMatcher([]StringMatcher{&equalStringMatcher{s: "FOO1", caseSensitive: false}, &equalStringMatcher{s: "FOO2", caseSensitive: false}}), &equalStringMatcher{s: "BAR", caseSensitive: false}})},
+		{`(?i:((foo|bar)))`, &equalMultiStringSliceMatcher{values: []string{"FOO", "BAR"}, lengthsMask: 0b1000, caseSensitive: false}},
+		{`(?i:((foo1|foo2|bar)))`, &equalMultiStringSliceMatcher{values: []string{"BAR", "FOO1", "FOO2"}, lengthsMask: 0b11000, caseSensitive: false}},
 		{"^((?i:foo|oo)|(bar))$", orStringMatcher([]StringMatcher{&equalStringMatcher{s: "FOO", caseSensitive: false}, &equalStringMatcher{s: "OO", caseSensitive: false}, &equalStringMatcher{s: "bar", caseSensitive: true}})},
-		{"(?i:(foo1|foo2|bar))", orStringMatcher([]StringMatcher{orStringMatcher([]StringMatcher{&equalStringMatcher{s: "FOO1", caseSensitive: false}, &equalStringMatcher{s: "FOO2", caseSensitive: false}}), &equalStringMatcher{s: "BAR", caseSensitive: false}})},
-		{".*foo.*", trueMatcher{}},     // The containsInOrder check done in the function returned by compileMatchStringFunction is sufficient.
-		{"(.*)foo.*", trueMatcher{}},   // The containsInOrder check done in the function returned by compileMatchStringFunction is sufficient.
-		{"(.*)foo(.*)", trueMatcher{}}, // The containsInOrder check done in the function returned by compileMatchStringFunction is sufficient.
+		{"(?i:(foo1|foo2|bar))", &equalMultiStringSliceMatcher{values: []string{"BAR", "FOO1", "FOO2"}, lengthsMask: 0b11000, caseSensitive: false}},
+		{".*foo.*", &containsStringMatcher{substrings: []string{"foo"}, left: trueMatcher{}, right: trueMatcher{}}},
+		{"(.*)foo.*", &containsStringMatcher{substrings: []string{"foo"}, left: trueMatcher{}, right: trueMatcher{}}},
+		{"(.*)foo(.*)", &containsStringMatcher{substrings: []string{"foo"}, left: trueMatcher{}, right: trueMatcher{}}},
 		{"(.+)foo(.*)", &containsStringMatcher{substrings: []string{"foo"}, left: &anyNonEmptyStringMatcher{matchNL: true}, right: trueMatcher{}}},
 		{"^.+foo.+", &containsStringMatcher{substrings: []string{"foo"}, left: &anyNonEmptyStringMatcher{matchNL: true}, right: &anyNonEmptyStringMatcher{matchNL: true}}},
-		{"^(.*)(foo)(.*)$", trueMatcher{}}, // The containsInOrder check done in the function returned by compileMatchStringFunction is sufficient.
+		{"^(.*)(foo)(.*)$", &containsStringMatcher{substrings: []string{"foo"}, left: trueMatcher{}, right: trueMatcher{}}},
 		{"^(.*)(foo|foobar)(.*)$", &containsStringMatcher{substrings: []string{"foo", "foobar"}, left: trueMatcher{}, right: trueMatcher{}}},
 		{"^(.*)(foo|foobar)(.+)$", &containsStringMatcher{substrings: []string{"foo", "foobar"}, left: trueMatcher{}, right: &anyNonEmptyStringMatcher{matchNL: true}}},
 		{"^(.*)(bar|b|buzz)(.+)$", &containsStringMatcher{substrings: []string{"bar", "b", "buzz"}, left: trueMatcher{}, right: &anyNonEmptyStringMatcher{matchNL: true}}},
@@ -399,14 +556,14 @@ func TestNewFastRegexMatcher(t *testing.T) {
 		{"(prometheus|api_prom)_api_v1_.+", &containsStringMatcher{substrings: []string{"prometheus_api_v1_", "api_prom_api_v1_"}, left: nil, right: &anyNonEmptyStringMatcher{matchNL: true}}},
 		{"^((.*)(bar|b|buzz)(.+)|foo)$", orStringMatcher([]StringMatcher{&containsStringMatcher{substrings: []string{"bar", "b", "buzz"}, left: trueMatcher{}, right: &anyNonEmptyStringMatcher{matchNL: true}}, &equalStringMatcher{s: "foo", caseSensitive: true}})},
 		{"((fo(bar))|.+foo)", orStringMatcher([]StringMatcher{orStringMatcher([]StringMatcher{&equalStringMatcher{s: "fobar", caseSensitive: true}}), &literalSuffixStringMatcher{suffix: "foo", suffixCaseSensitive: true, left: &anyNonEmptyStringMatcher{matchNL: true}}})},
-		{"(.+)/(gateway|cortex-gw|cortex-gw-internal)", &containsStringMatcher{substrings: []string{"/gateway", "/cortex-gw", "/cortex-gw-internal"}, left: &anyNonEmptyStringMatcher{matchNL: true}, right: nil}},
+		{"(.+)/(gateway|cortex-gw|cortex-gw-internal)", &containsStringMatcher{substrings: []string{"/cortex-gw", "/cortex-gw-internal", "/gateway"}, left: &anyNonEmptyStringMatcher{matchNL: true}, right: nil}},
 		// we don't support case insensitive matching for contains.
 		// This is because there's no strings.IndexOfFold function.
 		// We can revisit later if this is really popular by using strings.ToUpper.
 		{"^(.*)((?i)foo|foobar)(.*)$", nil},
 		{"(api|rpc)_(v1|prom)_((?i)push|query)", nil},
 		{"[a-z][a-z]", nil},
-		{"[1^3]", nil},
+		{"[1^3]", &equalMultiStringSliceMatcher{values: []string{"1", "3", "^"}, lengthsMask: 0b10, caseSensitive: true}},
 		{".*foo.*bar.*", trueMatcher{}}, // The containsInOrder check done in the function returned by compileMatchStringFunction is sufficient.
 		{`\d*`, nil},
 		{".", nil},
@@ -432,6 +589,8 @@ func TestNewFastRegexMatcher(t *testing.T) {
 		{"foo.?", &literalPrefixSensitiveStringMatcher{prefix: "foo", right: &zeroOrOneCharacterStringMatcher{matchNL: true}}},
 		{"f.?o", nil},
 		{".*foo.*|.*bar.*|.*baz.*", &containsStringMatcher{left: trueMatcher{}, substrings: []string{"foo", "bar", "baz"}, right: trueMatcher{}}},
+		{"(?i)report.scheduled.job_runscheduledreports", nil},
+		{"report.scheduled.job_runscheduledreports", nil},
 	} {
 		t.Run(c.pattern, func(t *testing.T) {
 			t.Parallel()
@@ -702,6 +861,249 @@ func randStrings(randGenerator *rand.Rand, many, length int) []string {
 		out = append(out, randString(randGenerator, length))
 	}
 	return out
+}
+
+func FuzzFastRegexMatcher_WithStaticallyDefinedRegularExpressions(f *testing.F) {
+	// Create all matchers.
+	matchers := make([]*FastRegexMatcher, 0, len(regexes))
+	res := make([]*regexp.Regexp, 0, len(regexes))
+	for _, re := range regexes {
+		m, err := NewFastRegexMatcher(re)
+		require.NoError(f, err)
+		r := regexp.MustCompile("^(?s:" + re + ")$")
+		matchers = append(matchers, m)
+		res = append(res, r)
+	}
+
+	// Add known values to seed corpus.
+	for _, v := range values {
+		f.Add(v)
+	}
+
+	f.Fuzz(func(t *testing.T, text string) {
+		for i, m := range matchers {
+			require.Equalf(t, res[i].MatchString(text), m.MatchString(text), "regexp: %s text: %s", res[i].String(), text)
+		}
+	})
+}
+
+func FuzzFastRegexMatcher_WithFuzzyRegularExpressions(f *testing.F) {
+	for _, re := range regexes {
+		for _, text := range values {
+			f.Add(re, text)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, re, text string) {
+		m, err := NewFastRegexMatcher(re)
+		if err != nil {
+			// Ignore invalid regexes.
+			return
+		}
+
+		reg, err := regexp.Compile("^(?s:" + re + ")$")
+		if err != nil {
+			// Ignore invalid regexes.
+			return
+		}
+
+		require.Equalf(t, reg.MatchString(text), m.MatchString(text), "regexp: %s text: %s", reg.String(), text)
+		require.Greaterf(t, m.SingleMatchCost(), 0.0, "regexp: %s", reg.String())
+	})
+}
+
+// This test can be used to analyze real queries from Mimir logs. You can extract real queries with a regexp matcher
+// running the following command:
+//
+// logcli --addr=XXX --username=YYY --password=ZZZ query '{namespace=~"(cortex|mimir).*",name="query-frontend"} |= "query stats" |= "=~" --limit=100000 > logs.txt
+//
+// against Loki.
+func TestAnalyzeRealQueries(t *testing.T) {
+	t.Skip("Decomment this test only to manually analyze real queries")
+
+	type labelValueInfo struct {
+		numMatchingQueries       int
+		numShardedQueries        int
+		numSplitQueries          int
+		optimized                bool
+		averageParsingTimeMillis float64
+
+		// Sorted list of timestamps when the queries have been received.
+		queryStartTimes []time.Time
+
+		// List of all queries execution wall times.
+		wallTimes []time.Duration
+	}
+
+	labelValueRE := regexp.MustCompile(`[=!]~(?:\\"|')([^"']*)(?:\\"|')`)
+	tsRE := regexp.MustCompile(`ts=([^ ]+)`)
+	shardedQueriesRE := regexp.MustCompile(`sharded_queries=(\d+)`)
+	splitQueriesRE := regexp.MustCompile(`split_queries=(\d+)`)
+	wallTimeSecondsRE := regexp.MustCompile(`query_wall_time_seconds=([0-9.]+)`)
+
+	labelValues := make(map[string]*labelValueInfo)
+
+	// Read the logs file line-by-line, and find all values for regex label matchers.
+	readFile, err := os.Open("logs.txt")
+	require.NoError(t, err)
+
+	fileScanner := bufio.NewScanner(readFile)
+	fileScanner.Split(bufio.ScanLines)
+
+	numQueries := 0
+
+	for fileScanner.Scan() {
+		line := fileScanner.Text()
+		matches := labelValueRE.FindAllStringSubmatch(line, -1)
+		if len(matches) == 0 {
+			continue
+		}
+
+		// Look up query stats.
+		tsRaw := tsRE.FindStringSubmatch(line)
+		shardedQueriesRaw := shardedQueriesRE.FindStringSubmatch(line)
+		splitQueriesRaw := splitQueriesRE.FindStringSubmatch(line)
+		wallTimeSecondsRaw := wallTimeSecondsRE.FindStringSubmatch(line)
+		shardedQueries := 0
+		splitQueries := 0
+		wallTimeSeconds := 0.
+		var ts time.Time
+
+		if len(tsRaw) > 0 {
+			ts, _ = time.Parse(time.RFC3339Nano, tsRaw[1])
+		}
+		if len(shardedQueriesRaw) > 0 {
+			shardedQueries, _ = strconv.Atoi(shardedQueriesRaw[1])
+		}
+		if len(splitQueriesRaw) > 0 {
+			splitQueries, _ = strconv.Atoi(splitQueriesRaw[1])
+		}
+		if len(wallTimeSecondsRaw) > 0 {
+			wallTimeSeconds, _ = strconv.ParseFloat(wallTimeSecondsRaw[1], 64)
+		}
+
+		numQueries++
+
+		for _, match := range matches {
+			info := labelValues[match[1]]
+			if info == nil {
+				info = &labelValueInfo{}
+				labelValues[match[1]] = info
+			}
+
+			info.numMatchingQueries++
+			info.numShardedQueries += shardedQueries
+			info.numSplitQueries += splitQueries
+
+			if !ts.IsZero() {
+				info.queryStartTimes = append(info.queryStartTimes, ts)
+			}
+
+			if wallTimeSeconds > 0 {
+				info.wallTimes = append(info.wallTimes, time.Duration(wallTimeSeconds*float64(time.Second)))
+			}
+		}
+	}
+
+	// Sort query start times.
+	for _, info := range labelValues {
+		sort.Slice(info.queryStartTimes, func(i, j int) bool {
+			return info.queryStartTimes[i].Before(info.queryStartTimes[j])
+		})
+	}
+
+	require.NoError(t, readFile.Close())
+	t.Logf("Found %d unique regexp matchers out of %d queries", len(labelValues), numQueries)
+
+	// Analyze each regexp matcher found.
+	numChecked := 0
+	numOptimized := 0
+
+	for re, info := range labelValues {
+		m, err := NewFastRegexMatcher(re)
+		if err != nil {
+			// Ignore it, because we may have failed to extract the label matcher.
+			continue
+		}
+
+		numChecked++
+
+		// Check if each regexp matcher is supported by our optimization.
+		if m.IsOptimized() {
+			numOptimized++
+			info.optimized = true
+		}
+
+		// Estimate the parsing complexity.
+		startTime := time.Now()
+		const numParsingRuns = 1000
+
+		for range numParsingRuns {
+			NewFastRegexMatcher(re)
+		}
+
+		info.averageParsingTimeMillis = float64(time.Since(startTime).Milliseconds()) / float64(numParsingRuns)
+	}
+
+	t.Logf("Found %d out of %d (%.2f%%) regexp matchers optimized by FastRegexMatcher", numOptimized, numChecked, (float64(numOptimized)/float64(numChecked))*100)
+
+	// Print some statistics.
+	for labelValue, info := range labelValues {
+		// Find the min/avg/max difference between query start times.
+		var (
+			minQueryStartTimeDiff time.Duration
+			maxQueryStartTimeDiff time.Duration
+			avgQueryStartTimeDiff time.Duration
+			sumQueryStartTime     time.Duration
+			countQueryStartTime   int
+
+			minWallTime time.Duration
+			maxWallTime time.Duration
+			avgWallTime time.Duration
+			sumWallTime time.Duration
+		)
+
+		// Compute min/max/avg query start times diff.
+		for i := 1; i < len(info.queryStartTimes); i++ {
+			diff := info.queryStartTimes[i].Sub(info.queryStartTimes[i-1])
+
+			sumQueryStartTime += diff
+			countQueryStartTime++
+
+			if minQueryStartTimeDiff == 0 || diff < minQueryStartTimeDiff {
+				minQueryStartTimeDiff = diff
+			}
+			if diff > maxQueryStartTimeDiff {
+				maxQueryStartTimeDiff = diff
+			}
+		}
+
+		if countQueryStartTime > 0 {
+			avgQueryStartTimeDiff = sumQueryStartTime / time.Duration(countQueryStartTime)
+		}
+
+		// Compute min/max/avg query execution time.
+		for i := 0; i < len(info.wallTimes); i++ {
+			sumWallTime += info.wallTimes[i]
+
+			if minWallTime == 0 || info.wallTimes[i] < minWallTime {
+				minWallTime = info.wallTimes[i]
+			}
+			if info.wallTimes[i] > maxWallTime {
+				maxWallTime = info.wallTimes[i]
+			}
+		}
+
+		if len(info.wallTimes) > 0 {
+			avgWallTime = sumWallTime / time.Duration(len(info.wallTimes))
+		}
+
+		t.Logf("num queries: %d\t num split queries: %d\t num sharded queries: %d\t optimized: %t\t parsing time: %.0fms\t min/avg/max query start time diff (sec): %.2f/%.2f/%.2f min/avg/max query wall time (sec): %.2f/%.2f/%.2f regexp: %s",
+			info.numMatchingQueries, info.numSplitQueries, info.numShardedQueries, info.optimized, info.averageParsingTimeMillis,
+			minQueryStartTimeDiff.Seconds(), avgQueryStartTimeDiff.Seconds(), maxQueryStartTimeDiff.Seconds(),
+			minWallTime.Seconds(), avgWallTime.Seconds(), maxWallTime.Seconds(),
+			labelValue)
+	}
 }
 
 func randStringsWithSuffix(randGenerator *rand.Rand, many, length int, suffix string) []string {
@@ -1270,6 +1672,16 @@ func TestLiteralPrefixInsensitiveStringMatcher(t *testing.T) {
 	require.False(t, m.Matches("marco"))
 	require.False(t, m.Matches("ma"))
 	require.True(t, m.Matches("mAr"))
+
+	// The prefix of the matched string can have a different length than the
+	// literal prefix due to Unicode simple case folding ('k' folds with the
+	// Kelvin sign 'K', U+212A).
+	m = &literalPrefixInsensitiveStringMatcher{prefix: "kar", right: &equalStringMatcher{s: "co", caseSensitive: false}}
+	require.True(t, m.Matches("karco"))
+	require.True(t, m.Matches("\u212aarco"))
+	require.True(t, m.Matches("\u212aarCO"))
+	require.False(t, m.Matches("\u212aar"))
+	require.False(t, m.Matches("\u212aarcopracucci"))
 }
 
 func TestLiteralSuffixStringMatcher(t *testing.T) {
@@ -1298,6 +1710,16 @@ func TestLiteralSuffixStringMatcher(t *testing.T) {
 	require.True(t, m.Matches("marCO"))
 	require.False(t, m.Matches("mar"))
 	require.False(t, m.Matches("marcopracucci"))
+
+	// The suffix of the matched string can have a different length than the
+	// literal suffix due to Unicode simple case folding ('k' folds with the
+	// Kelvin sign 'K', U+212A).
+	m = &literalSuffixStringMatcher{left: &equalStringMatcher{s: "mar", caseSensitive: false}, suffix: "ck", suffixCaseSensitive: false}
+	require.True(t, m.Matches("marck"))
+	require.True(t, m.Matches("marc\u212a"))
+	require.True(t, m.Matches("MARc\u212a"))
+	require.False(t, m.Matches("marc"))
+	require.False(t, m.Matches("c\u212a"))
 }
 
 func TestHasPrefixCaseInsensitive(t *testing.T) {
@@ -1309,14 +1731,82 @@ func TestHasPrefixCaseInsensitive(t *testing.T) {
 
 	require.False(t, hasPrefixCaseInsensitive("marco", "a"))
 	require.False(t, hasPrefixCaseInsensitive("marco", "abcdefghi"))
+
+	// Case folding can change the encoded length of a rune, e.g. 'k' folds
+	// with 'K' (Kelvin sign, U+212A) and 's' folds with 'ſ' (long s, U+017F).
+	require.True(t, hasPrefixCaseInsensitive("\u212aelvin", "k"))
+	require.True(t, hasPrefixCaseInsensitive("\u212aelvin", "kel"))
+	require.True(t, hasPrefixCaseInsensitive("kelvin", "\u212a"))
+	require.True(t, hasPrefixCaseInsensitive("ſtreet", "st"))
+	require.False(t, hasPrefixCaseInsensitive("\u212aelvin", "s"))
 }
 
-func TestHasSuffixCaseInsensitive(t *testing.T) {
-	require.True(t, hasSuffixCaseInsensitive("marco", "rco"))
-	require.True(t, hasSuffixCaseInsensitive("marco", "RcO"))
-	require.True(t, hasSuffixCaseInsensitive("marco", "marco"))
-	require.False(t, hasSuffixCaseInsensitive("marco", "a"))
-	require.False(t, hasSuffixCaseInsensitive("marco", "abcdefghi"))
+func TestPrefixCaseInsensitiveMatchLen(t *testing.T) {
+	for _, c := range []struct {
+		s, prefix   string
+		expectedLen int
+		expectedOK  bool
+	}{
+		{"marco", "mar", 3, true},
+		{"mArco", "MaR", 3, true},
+		{"marco", "marco", 5, true},
+		{"mar", "marco", 0, false},
+		{"marco", "x", 0, false},
+		{"", "", 0, true},
+		{"marco", "", 0, true},
+		// The matched prefix of s can have a different length than the
+		// searched prefix due to Unicode simple case folding.
+		{"\u212aelvin", "k", 3, true},
+		{"\u212aelvin", "kel", 5, true},
+		{"kelvin", "\u212a", 1, true},
+		{"ſtreet", "st", 3, true},
+		{"streets", "ſt", 2, true},
+		{"ſſs", "sss", 5, true},
+		{"ſtreet", "str", 4, true},
+		{"\u212aelvin", "s", 0, false},
+		{"ſtreet", "sx", 0, false},
+		// Invalid UTF-8 is decoded to U+FFFD, which folds only with itself.
+		{"\xff", "\xff", 1, true},
+		{"\xffabc", "\xffab", 3, true},
+		{"\u212aelvin", "\xff", 0, false},
+	} {
+		n, ok := prefixCaseInsensitiveMatchLen(c.s, c.prefix)
+		require.Equal(t, c.expectedOK, ok, "s=%q prefix=%q", c.s, c.prefix)
+		require.Equal(t, c.expectedLen, n, "s=%q prefix=%q", c.s, c.prefix)
+	}
+}
+
+func TestSuffixCaseInsensitiveMatchLen(t *testing.T) {
+	for _, c := range []struct {
+		s, suffix   string
+		expectedLen int
+		expectedOK  bool
+	}{
+		{"marco", "rco", 3, true},
+		{"marco", "RcO", 3, true},
+		{"marco", "marco", 5, true},
+		{"rco", "marco", 0, false},
+		{"marco", "x", 0, false},
+		{"", "", 0, true},
+		{"marco", "", 0, true},
+		// The matched suffix of s can have a different length than the
+		// searched suffix due to Unicode simple case folding.
+		{"a\u212a", "k", 3, true},
+		{"drin\u212a", "ink", 5, true},
+		{"drink", "in\u212a", 3, true},
+		{"streetſ", "ts", 3, true},
+		{"ſſs", "sss", 5, true},
+		{"a\u212a", "s", 0, false},
+		{"streetſ", "tſt", 0, false},
+		// Invalid UTF-8 is decoded to U+FFFD, which folds only with itself.
+		{"\xff", "\xff", 1, true},
+		{"abc\xff", "bc\xff", 3, true},
+		{"a\u212a", "\xff", 0, false},
+	} {
+		n, ok := suffixCaseInsensitiveMatchLen(c.s, c.suffix)
+		require.Equal(t, c.expectedOK, ok, "s=%q suffix=%q", c.s, c.suffix)
+		require.Equal(t, c.expectedLen, n, "s=%q suffix=%q", c.s, c.suffix)
+	}
 }
 
 func TestContainsInOrder(t *testing.T) {
@@ -1417,6 +1907,11 @@ func TestIsSimpleConcatenationPattern(t *testing.T) {
 		".*-.*-.*-.*-":   false,
 		"-":              false,
 		".*":             false,
+		// Single-literal concatenations are intentionally not treated as simple
+		// concatenation patterns here (numLiterals > 1); they are handled by the
+		// empty-string subexpression removal in stringMatcherFromRegexp.
+		`.*\|foo\|.*`:   false,
+		`.*\|(foo)\|.*`: false,
 	}
 
 	for testCase, expected := range testCases {

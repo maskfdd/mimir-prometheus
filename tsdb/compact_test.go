@@ -15,8 +15,10 @@ package tsdb
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"os"
@@ -29,9 +31,11 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -171,6 +175,78 @@ func TestNoPanicFor0Tombstones(t *testing.T) {
 	require.NoError(t, err)
 
 	c.plan(metas)
+}
+
+// staleMetaRange is like metaRange but tags the block with the from-stale-series hint.
+func staleMetaRange(name string, mint, maxt int64) dirMeta {
+	dm := metaRange(name, mint, maxt, nil)
+	dm.meta.Compaction.SetStaleSeries()
+	return dm
+}
+
+// TestPlanDoesNotMergeStaleAndNonStaleBlocks verifies that the planner never
+// groups a from-stale-series block with non-stale blocks. Mixing them would
+// drop the hint on the merged block, which would then wrongly count towards
+// inOrderBlocksMaxTime and advance the WAL-replay cutoff past WAL-only data.
+// See https://github.com/prometheus/prometheus/issues/18379.
+func TestPlanDoesNotMergeStaleAndNonStaleBlocks(t *testing.T) {
+	compactor, err := NewLeveledCompactor(context.Background(), nil, promslog.NewNopLogger(), []int64{
+		20,
+		60,
+		180,
+	}, nil, nil)
+	require.NoError(t, err)
+
+	t.Run("stale and non-stale in the same range are not merged", func(t *testing.T) {
+		// Two non-stale blocks and one stale block all fall into the same 60-wide
+		// range [0,60). Without segregation the planner would return all three;
+		// with segregation it must only return the two non-stale blocks.
+		metas := []dirMeta{
+			metaRange("1", 0, 20, nil),
+			staleMetaRange("stale", 0, 20),
+			metaRange("2", 20, 40, nil),
+			metaRange("3", 40, 60, nil),
+			// A fresh block so the last (most recent) block is excluded as usual.
+			metaRange("fresh", 60, 80, nil),
+		}
+
+		res, err := compactor.plan(metas)
+		require.NoError(t, err)
+		require.NotContains(t, res, "stale", "stale block must not be merged with non-stale blocks")
+		require.Equal(t, []string{"1", "2", "3"}, res)
+	})
+
+	t.Run("stale blocks are merged together", func(t *testing.T) {
+		// Three stale blocks fill the 60-wide range [0,60) and a fourth stale block
+		// makes that range no longer the most recent, so the three are compacted
+		// together: stale data still gets compacted, just never mixed with non-stale.
+		metas := []dirMeta{
+			staleMetaRange("s1", 0, 20),
+			staleMetaRange("s2", 20, 40),
+			staleMetaRange("s3", 40, 60),
+			staleMetaRange("s4", 60, 80),
+		}
+
+		res, err := compactor.plan(metas)
+		require.NoError(t, err)
+		require.Equal(t, []string{"s1", "s2", "s3"}, res)
+	})
+
+	t.Run("stale blocks are planned when there is nothing to do for non-stale", func(t *testing.T) {
+		// A single non-stale block (nothing to merge) plus a full stale range.
+		// The non-stale class yields nothing, so the stale class must be planned.
+		metas := []dirMeta{
+			metaRange("1", 0, 20, nil),
+			staleMetaRange("s1", 0, 20),
+			staleMetaRange("s2", 20, 40),
+			staleMetaRange("s3", 40, 60),
+			staleMetaRange("s4", 60, 80),
+		}
+
+		res, err := compactor.plan(metas)
+		require.NoError(t, err)
+		require.Equal(t, []string{"s1", "s2", "s3"}, res)
+	})
 }
 
 func TestLeveledCompactor(t *testing.T) {
@@ -505,9 +581,24 @@ func TestCompactionFailWillCleanUpTempDir(t *testing.T) {
 
 	tmpdir := t.TempDir()
 
-	require.Error(t, compactor.write(tmpdir, &BlockMeta{}, DefaultBlockPopulator{}, erringBReader{}))
-	_, err = os.Stat(filepath.Join(tmpdir, BlockMeta{}.ULID.String()) + tmpForCreationBlockDirSuffix)
-	require.True(t, os.IsNotExist(err), "directory is not cleaned up")
+	shardedBlocks := []shardedBlock{
+		{meta: &BlockMeta{ULID: ulid.MustNew(ulid.Now(), crand.Reader)}},
+		{meta: &BlockMeta{ULID: ulid.MustNew(ulid.Now(), crand.Reader)}},
+		{meta: &BlockMeta{ULID: ulid.MustNew(ulid.Now(), crand.Reader)}},
+	}
+
+	require.Error(t, compactor.write(tmpdir, shardedBlocks, DefaultBlockPopulator{}, erringBReader{}))
+
+	// We rely on the fact that blockDir and tmpDir will be updated by compactor.write.
+	for _, b := range shardedBlocks {
+		require.NotEmpty(t, b.tmpDir)
+		_, err = os.Stat(b.tmpDir)
+		require.True(t, os.IsNotExist(err), "tmp directory is not cleaned up")
+
+		require.NotEmpty(t, b.blockDir)
+		_, err = os.Stat(b.blockDir)
+		require.True(t, os.IsNotExist(err), "block directory is not cleaned up")
+	}
 }
 
 func metaRange(name string, mint, maxt int64, stats *BlockStats) dirMeta {
@@ -549,6 +640,190 @@ func samplesForRange(minTime, maxTime int64, maxSamplesPerChunk int) (ret [][]sa
 	return ret
 }
 
+func TestCompaction_CompactWithSplitting(t *testing.T) {
+	seriesCounts := []int{10, 1234}
+	shardCounts := []uint64{1, 13}
+	ctx := context.Background()
+
+	for _, series := range seriesCounts {
+		dir, err := os.MkdirTemp("", "compact")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, os.RemoveAll(dir))
+		}()
+
+		ranges := [][2]int64{{0, 5000}, {3000, 8000}, {6000, 11000}, {9000, 14000}}
+
+		// Generate blocks.
+		var blockDirs []string
+		var openBlocks []*Block
+
+		for _, r := range ranges {
+			block, err := OpenBlock(nil, createBlock(t, dir, genSeries(series, 10, r[0], r[1])), nil, nil)
+			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, block.Close())
+			}()
+
+			openBlocks = append(openBlocks, block)
+			blockDirs = append(blockDirs, block.Dir())
+		}
+
+		for _, shardCount := range shardCounts {
+			t.Run(fmt.Sprintf("series=%d, shards=%d", series, shardCount), func(t *testing.T) {
+				c, err := NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{0}, nil, nil)
+				require.NoError(t, err)
+
+				blockIDs, err := c.CompactWithSplitting(dir, blockDirs, openBlocks, shardCount)
+
+				require.NoError(t, err)
+				require.Equal(t, shardCount, uint64(len(blockIDs)))
+
+				// Verify resulting blocks. We will iterate over all series in all blocks, and check two things:
+				// 1) Make sure that each series in the block belongs to the block (based on sharding).
+				// 2) Verify that total number of series over all blocks is correct.
+				totalSeries := uint64(0)
+
+				ts := uint64(0)
+				for shardIndex, blockID := range blockIDs {
+					// Some blocks may be empty, they will have zero block ID.
+					if blockID == (ulid.ULID{}) {
+						continue
+					}
+
+					// All blocks have the same timestamp.
+					if ts == 0 {
+						ts = blockID.Time()
+					} else {
+						require.Equal(t, ts, blockID.Time())
+					}
+
+					// Symbols found in series.
+					seriesSymbols := map[string]struct{}{}
+
+					// We always expect to find "" symbol in the symbols table even if it's not in the series.
+					// Head compaction always includes it, and then it survives additional non-sharded compactions.
+					// Our splitting compaction preserves it too.
+					seriesSymbols[""] = struct{}{}
+
+					block, err := OpenBlock(promslog.NewNopLogger(), filepath.Join(dir, blockID.String()), nil, nil)
+					require.NoError(t, err)
+
+					defer func() {
+						require.NoError(t, block.Close())
+					}()
+
+					totalSeries += block.Meta().Stats.NumSeries
+
+					idxr, err := block.Index()
+					require.NoError(t, err)
+
+					defer func() {
+						require.NoError(t, idxr.Close())
+					}()
+
+					k, v := index.AllPostingsKey()
+					p, err := idxr.Postings(ctx, k, v)
+					require.NoError(t, err)
+
+					var lbls labels.ScratchBuilder
+					for p.Next() {
+						ref := p.At()
+						require.NoError(t, idxr.Series(ref, &lbls, nil))
+
+						require.Equal(t, uint64(shardIndex), labels.StableHash(lbls.Labels())%shardCount)
+
+						// Collect all symbols used by series.
+						lbls.Labels().Range(func(l labels.Label) {
+							seriesSymbols[l.Name] = struct{}{}
+							seriesSymbols[l.Value] = struct{}{}
+						})
+					}
+					require.NoError(t, p.Err())
+
+					// Check that all symbols in symbols table are actually used by series.
+					symIt := idxr.Symbols()
+					for symIt.Next() {
+						w := symIt.At()
+						_, ok := seriesSymbols[w]
+						require.True(t, ok, "not found in series: '%s'", w)
+						delete(seriesSymbols, w)
+					}
+
+					// Check that symbols table covered all symbols found from series.
+					require.Empty(t, seriesSymbols)
+				}
+
+				require.Equal(t, uint64(series), totalSeries)
+
+				// Source blocks are *not* deletable.
+				for _, b := range openBlocks {
+					require.False(t, b.meta.Compaction.Deletable)
+				}
+			})
+		}
+	}
+}
+
+func TestCompaction_CompactEmptyBlocks(t *testing.T) {
+	dir, err := os.MkdirTemp("", "compact")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, os.RemoveAll(dir))
+	}()
+
+	ranges := [][2]int64{{0, 5000}, {3000, 8000}, {6000, 11000}, {9000, 14000}}
+
+	// Generate blocks.
+	var blockDirs []string
+
+	for _, r := range ranges {
+		// Generate blocks using index and chunk writer. CreateBlock would not return valid block for 0 series.
+		id := ulid.MustNew(ulid.Now(), crand.Reader)
+		m := &BlockMeta{
+			ULID:       id,
+			MinTime:    r[0],
+			MaxTime:    r[1],
+			Compaction: BlockMetaCompaction{Level: 1, Sources: []ulid.ULID{id}},
+			Version:    metaVersion1,
+		}
+
+		bdir := filepath.Join(dir, id.String())
+		require.NoError(t, os.Mkdir(bdir, 0o777))
+		require.NoError(t, os.Mkdir(chunkDir(bdir), 0o777))
+
+		_, err := writeMetaFile(promslog.NewNopLogger(), bdir, m)
+		require.NoError(t, err)
+
+		iw, err := index.NewWriter(context.Background(), filepath.Join(bdir, indexFilename))
+		require.NoError(t, err)
+
+		require.NoError(t, iw.AddSymbol("hello"))
+		require.NoError(t, iw.AddSymbol("world"))
+		require.NoError(t, iw.Close())
+
+		blockDirs = append(blockDirs, bdir)
+	}
+
+	c, err := NewLeveledCompactor(context.Background(), nil, promslog.NewNopLogger(), []int64{0}, nil, nil)
+	require.NoError(t, err)
+
+	blockIDs, err := c.CompactWithSplitting(dir, blockDirs, nil, 5)
+	require.NoError(t, err)
+
+	// There are no output blocks.
+	for _, b := range blockIDs {
+		require.Equal(t, ulid.ULID{}, b)
+	}
+
+	// All source blocks are now marked for deletion.
+	for _, b := range blockDirs {
+		meta, _, err := readMetaFile(b)
+		require.NoError(t, err)
+		require.True(t, meta.Compaction.Deletable)
+	}
+}
+
 func TestCompaction_populateBlock(t *testing.T) {
 	for _, tc := range []struct {
 		title              string
@@ -562,7 +837,7 @@ func TestCompaction_populateBlock(t *testing.T) {
 		{
 			title:              "Populate block from empty input should return error.",
 			inputSeriesSamples: [][]seriesSamples{},
-			expErr:             errors.New("cannot populate block from no readers"),
+			expErr:             errors.New("cannot populate block(s) from no readers"),
 		},
 		{
 			// Populate from single block without chunks. We expect these kind of series being ignored.
@@ -1098,12 +1373,13 @@ func TestCompaction_populateBlock(t *testing.T) {
 			}
 
 			iw := &mockIndexWriter{}
+			ob := shardedBlock{meta: meta, indexw: iw, chunkw: nopChunkWriter{}}
 			blockPopulator := DefaultBlockPopulator{}
 			irPostingsFunc := AllSortedPostings
 			if tc.irPostingsFunc != nil {
 				irPostingsFunc = tc.irPostingsFunc
 			}
-			err = blockPopulator.PopulateBlock(c.ctx, c.metrics, c.logger, c.chunkPool, c.mergeFunc, blocks, meta, iw, nopChunkWriter{}, irPostingsFunc)
+			err = blockPopulator.PopulateBlock(c.ctx, c.metrics, c.logger, c.chunkPool, c.mergeFunc, c.concurrencyOpts, blocks, meta.MinTime, meta.MaxTime, []shardedBlock{ob}, irPostingsFunc)
 			if tc.expErr != nil {
 				require.EqualError(t, err, tc.expErr.Error())
 				return
@@ -1270,6 +1546,118 @@ func BenchmarkCompactionFromHead(b *testing.B) {
 			h.Close()
 		})
 	}
+
+	// Sub-benchmark with multiple head chunks per series, as can happen with
+	// native histograms that trigger a counter reset on every sample. This
+	// stresses the linked-list traversal in s.chunk() and exercises the
+	// head-chunk cache.
+	for _, tc := range []struct{ series, chunks int }{
+		{100000, 1},  // Baseline: cache skipped (prev==nil).
+		{100000, 10}, // Realistic: cache active, but improvement negligible vs total compaction cost.
+		{10, 100},    // Moderate pathological case.
+		{10, 1000},   // Heavy pathological case.
+	} {
+		nSeries, nChunks := tc.series, tc.chunks
+		b.Run(fmt.Sprintf("many head chunks/series=%d,chunks=%d", nSeries, nChunks), func(b *testing.B) {
+			dir := b.TempDir()
+			chunkDir := b.TempDir()
+			opts := DefaultHeadOptions()
+			opts.ChunkRange = int64(nChunks+1) * 1000 // Wide enough so nothing gets mmapped.
+			opts.ChunkDirRoot = chunkDir
+			h, err := NewHead(nil, nil, nil, nil, opts, nil)
+			require.NoError(b, err)
+
+			app := h.Appender(b.Context())
+			for i := range nSeries {
+				lbls := labels.FromStrings("__name__", "bench", "series", strconv.Itoa(i))
+				for j := range nChunks {
+					// Counter reset on every histogram forces a new head chunk per sample.
+					hist := tsdbutil.GenerateTestHistogramWithHint(j, histogram.CounterReset)
+					_, err := app.AppendHistogram(0, lbls, int64(j)*1000, hist, nil)
+					require.NoError(b, err)
+				}
+			}
+			require.NoError(b, app.Commit())
+
+			// Verify we actually have the expected number of head chunks.
+			for i := range nSeries {
+				lbls := labels.FromStrings("__name__", "bench", "series", strconv.Itoa(i))
+				s := h.series.getByHash(lbls.Hash(), lbls)
+				require.NotNil(b, s, "series %d not found", i)
+				require.Equal(b, uint32(nChunks), s.headChunkCount.Load(), "series %d: unexpected head chunk count", i)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				createBlockFromHead(b, filepath.Join(dir, strconv.Itoa(i)), h)
+			}
+			h.Close()
+		})
+	}
+}
+
+func TestCompactionFromHead(t *testing.T) {
+	t.Run("multiple head chunks", func(t *testing.T) {
+		// Verify compaction from a Head with multiple head chunks per series
+		// produces correct blocks. This exercises the chunkCacheEnabler path
+		// in PopulateBlock, which enables the head-chunk cache during
+		// compaction for O(1) chunk lookups.
+		opts := DefaultHeadOptions()
+		opts.ChunkRange = 100
+		opts.ChunkDirRoot = t.TempDir()
+		h, err := NewHead(nil, nil, nil, nil, opts, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, h.Close()) })
+
+		// Append enough samples to create multiple head chunks.
+		// With ChunkRange=100 and DefaultSamplesPerChunk=120, each chunk holds
+		// ~20 samples (range/step = 100/5). 200 samples → ~10 head chunks.
+		lbls := labels.FromStrings("__name__", "test")
+		var expSamples []sample
+		app := h.Appender(t.Context())
+		for i := int64(0); i < 1000; i += 5 {
+			_, err := app.Append(0, lbls, i, float64(i))
+			require.NoError(t, err)
+			expSamples = append(expSamples, sample{t: i, f: float64(i)})
+		}
+		require.NoError(t, app.Commit())
+
+		// Verify we have multiple head chunks.
+		s := h.series.getByID(1)
+		require.NotNil(t, s)
+		s.Lock()
+		headChunks := int(s.headChunkCount.Load())
+		s.Unlock()
+		require.Greater(t, headChunks, 1, "need multiple head chunks for this test")
+
+		// Compact from head.
+		blockDir := createBlockFromHead(t, t.TempDir(), h)
+
+		// Re-read the block and verify all samples survived.
+		block, err := OpenBlock(promslog.NewNopLogger(), blockDir, nil, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, block.Close()) })
+
+		q, err := NewBlockQuerier(block, math.MinInt64, math.MaxInt64)
+		require.NoError(t, err)
+		defer q.Close()
+
+		ss := q.Select(t.Context(), false, nil, labels.MustNewMatcher(labels.MatchEqual, "__name__", "test"))
+		require.True(t, ss.Next(), "expected a series")
+
+		var actSamples []sample
+		it := ss.At().Iterator(nil)
+		for it.Next() == chunkenc.ValFloat {
+			ts, v := it.At()
+			actSamples = append(actSamples, sample{t: ts, f: v})
+		}
+		require.NoError(t, it.Err())
+		require.False(t, ss.Next(), "expected only one series")
+		require.NoError(t, ss.Err())
+
+		require.Equal(t, expSamples, actSamples, "compacted block should contain all samples")
+	})
 }
 
 func BenchmarkCompactionFromOOOHead(b *testing.B) {
@@ -1308,6 +1696,150 @@ func BenchmarkCompactionFromOOOHead(b *testing.B) {
 				createBlockFromOOOHead(b, filepath.Join(dir, fmt.Sprintf("%d-%d", i, labelNames)), oooHead)
 			}
 			h.Close()
+		})
+	}
+}
+
+// setupDBForSelectedSeriesBenchmark opens a fresh DB whose head contains
+// totalSeries series, each with samplesPerSeries in-order samples confined to
+// a single 1s head chunk range. It returns the DB and the head series
+// refs in append order.
+//
+// Auto-compaction is disabled so the benchmark observes exactly the state
+// produced by this helper. The caller owns the returned DB and must close it.
+//
+// The helper is shared by BenchmarkCompactSelectedSeries and the upcoming
+// filterSeriesAndSortPostings benchmark, so it does not assume which entry
+// point will use the setup.
+func setupDBForSelectedSeriesBenchmark(tb testing.TB, totalSeries, samplesPerSeries int) (*DB, []storage.SeriesRef) {
+	require.Positive(tb, samplesPerSeries, "samplesPerSeries must be > 0")
+	require.LessOrEqual(tb, samplesPerSeries, 1000, "samples must fit one head chunk range (1000 ms)")
+
+	opts := DefaultOptions()
+	opts.MinBlockDuration = 1000
+	opts.MaxBlockDuration = 1000
+	db, err := Open(tb.TempDir(), nil, nil, opts, nil)
+	require.NoError(tb, err)
+	db.DisableCompactions()
+
+	const appendBatch = 10_000
+	refs := make([]storage.SeriesRef, 0, totalSeries)
+	app := db.Appender(context.Background())
+	for i := range totalSeries {
+		lbls := labels.FromStrings("__name__", "metric", "instance", strconv.Itoa(i))
+		var ref storage.SeriesRef
+		for ts := int64(0); ts < int64(samplesPerSeries); ts++ {
+			ref, err = app.Append(ref, lbls, ts, float64(ts))
+			require.NoError(tb, err)
+		}
+		refs = append(refs, ref)
+		if (i+1)%appendBatch == 0 {
+			require.NoError(tb, app.Commit())
+			app = db.Appender(context.Background())
+		}
+	}
+	require.NoError(tb, app.Commit())
+	return db, refs
+}
+
+// pickRefsEvenly returns count refs sampled at approximately even intervals
+// across refs. This distributes the selected refs over the full input range
+// rather than clustering them, which is useful for benchmarks that want
+// postings intersections to scan most of the postings list.
+func pickRefsEvenly(refs []storage.SeriesRef, count int) []storage.SeriesRef {
+	if count >= len(refs) {
+		out := make([]storage.SeriesRef, len(refs))
+		copy(out, refs)
+		return out
+	}
+	out := make([]storage.SeriesRef, 0, count)
+	step := float64(len(refs)) / float64(count)
+	for i := range count {
+		out = append(out, refs[int(float64(i)*step)])
+	}
+	return out
+}
+
+// BenchmarkCompactSelectedSeries measures the end-to-end cost of compacting a
+// selected subset of head series into blocks and evicting them from the head.
+//
+// The benchmark keeps the head size fixed and varies the selected fraction
+// (100%, 50%, 30%, 10%, 1%, and 0.1%). A 100% selection approximates the
+// workload of CompactStaleHead, while smaller fractions measure how much work
+// is avoided when SelectedSeriesHead restricts compaction to a small subset of
+// series.
+//
+// Each iteration rebuilds the DB because CompactSelectedSeries is destructive:
+// selected series are evicted from the head and cannot be reused by subsequent
+// iterations.
+//
+// Each series contains DefaultSamplesPerChunk samples, matching the TSDB's
+// target chunk size so chunk-writing costs are representative of production
+// workloads rather than degenerate single-sample chunks.
+func BenchmarkCompactSelectedSeries(b *testing.B) {
+	const (
+		totalSeries      = 100_000
+		samplesPerSeries = DefaultSamplesPerChunk
+	)
+	fractions := []float64{1.0, 0.5, 0.3, 0.1, 0.01, 0.001}
+
+	for _, fraction := range fractions {
+		selectedCount := max(1, int(float64(totalSeries)*fraction))
+		b.Run(fmt.Sprintf("totalSeries=%d/selectedSeries=%d", totalSeries, selectedCount), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				b.StopTimer()
+				db, allRefs := setupDBForSelectedSeriesBenchmark(b, totalSeries, samplesPerSeries)
+				selectedRefs := pickRefsEvenly(allRefs, selectedCount)
+				b.StartTimer()
+
+				require.NoError(b, db.CompactSelectedSeries(selectedRefs))
+
+				b.StopTimer()
+				require.NoError(b, db.Close())
+				b.StartTimer()
+			}
+		})
+	}
+}
+
+// BenchmarkFilterSeriesAndSortPostings measures the cost of
+// Head.filterSeriesAndSortPostings under the isSeriesWithoutOOO predicate.
+// This is the filtering step performed by CompactSelectedSeries while holding
+// db.cmtx, before invoking compactHeadViewLocked.
+//
+// The operation is O(N log N) in the number of candidate refs and is a likely
+// contributor to the fixed-cost floor observed at low selectivity in
+// BenchmarkCompactSelectedSeries.
+//
+// The benchmark varies the input size as a fraction of a fixed head size,
+// mirroring BenchmarkCompactSelectedSeries so the results can be compared
+// directly. The head is built once per sub-benchmark because the function is
+// non-destructive.
+//
+// samplesPerSeries matches BenchmarkCompactSelectedSeries for setup
+// consistency, although the filter only examines series-level state and is
+// insensitive to its value.
+func BenchmarkFilterSeriesAndSortPostings(b *testing.B) {
+	const (
+		totalSeries      = 100_000
+		samplesPerSeries = DefaultSamplesPerChunk
+	)
+	fractions := []float64{1.0, 0.5, 0.3, 0.1, 0.01, 0.001}
+
+	for _, fraction := range fractions {
+		inputCount := max(1, int(float64(totalSeries)*fraction))
+		b.Run(fmt.Sprintf("totalSeries=%d/inputSeries=%d", totalSeries, inputCount), func(b *testing.B) {
+			db, allRefs := setupDBForSelectedSeriesBenchmark(b, totalSeries, samplesPerSeries)
+			b.Cleanup(func() { require.NoError(b, db.Close()) })
+			inputRefs := pickRefsEvenly(allRefs, inputCount)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for b.Loop() {
+				_, err := db.head.filterSeriesAndSortPostings(index.NewListPostings(inputRefs), isSeriesWithoutOOO)
+				require.NoError(b, err)
+			}
 		})
 	}
 }
@@ -1367,69 +1899,76 @@ func TestDisableAutoCompactions(t *testing.T) {
 // TestCancelCompactions ensures that when the db is closed
 // any running compaction is cancelled to unblock closing the db.
 func TestCancelCompactions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		compactionStarted := make(chan struct{})
+		compactionCanceled := make(chan struct{})
+
+		opts := DefaultOptions()
+		opts.NewCompactorFunc = func(ctx context.Context, _ prometheus.Registerer, _ *slog.Logger, _ []int64, _ chunkenc.Pool, _ *Options) (Compactor, error) {
+			return &mockCompactorFn{
+				planFn: func() ([]string, error) {
+					return []string{"block-a", "block-b"}, nil
+				},
+				compactFn: func() ([]ulid.ULID, error) {
+					close(compactionStarted)
+					<-ctx.Done()
+					close(compactionCanceled)
+					return nil, ctx.Err()
+				},
+				// writeFn is unused: this test never reaches the head, OOO,
+				// or stale-series compaction paths that would call Write.
+				writeFn: func() ([]ulid.ULID, error) {
+					return nil, nil
+				},
+			}, nil
+		}
+		db := newTestDB(t, withOpts(opts))
+
+		db.compactc <- struct{}{}
+		<-compactionStarted
+
+		require.NoError(t, db.Close())
+		<-compactionCanceled
+
+		// Wrapped context.Canceled must not be counted as a real compaction
+		// failure (verifies errors.Is at every level of the chain).
+		require.Equal(t, 0.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed))
+	})
+}
+
+type blockPopulatorFunc func(context.Context, *CompactorMetrics, *slog.Logger, chunkenc.Pool, storage.VerticalChunkSeriesMergeFunc, LeveledCompactorConcurrencyOptions, []BlockReader, int64, int64, []shardedBlock, IndexReaderPostingsFunc) error
+
+func (f blockPopulatorFunc) PopulateBlock(ctx context.Context, metrics *CompactorMetrics, logger *slog.Logger, chunkPool chunkenc.Pool, mergeFunc storage.VerticalChunkSeriesMergeFunc, concurrencyOpts LeveledCompactorConcurrencyOptions, blocks []BlockReader, minT, maxT int64, outBlocks []shardedBlock, postingsFunc IndexReaderPostingsFunc) error {
+	return f(ctx, metrics, logger, chunkPool, mergeFunc, concurrencyOpts, blocks, minT, maxT, outBlocks, postingsFunc)
+}
+
+// TestCanceledCompactionDoesNotMarkBlocksFailed ensures that a compaction
+// aborted via context cancellation does not mark its source blocks as
+// Compaction.Failed. The context.Canceled error must be detected with
+// errors.Is so wrapped values are still recognized at every level.
+func TestCanceledCompactionDoesNotMarkBlocksFailed(t *testing.T) {
 	t.Parallel()
+
 	tmpdir := t.TempDir()
+	blockDirs := []string{
+		createBlock(t, tmpdir, genSeries(1, 1, 0, 100)),
+		createBlock(t, tmpdir, genSeries(1, 1, 100, 200)),
+	}
 
-	// Create some blocks to fall within the compaction range.
-	createBlock(t, tmpdir, genSeries(1, 10000, 0, 1000))
-	createBlock(t, tmpdir, genSeries(1, 10000, 1000, 2000))
-	createBlock(t, tmpdir, genSeries(1, 1, 2000, 2001)) // The most recent block is ignored so can be e small one.
-
-	// Copy the db so we have an exact copy to compare compaction times.
-	tmpdirCopy := t.TempDir()
-	err := fileutil.CopyDirs(tmpdir, tmpdirCopy)
+	compactor, err := NewLeveledCompactor(t.Context(), nil, promslog.NewNopLogger(), []int64{200}, nil, nil)
 	require.NoError(t, err)
 
-	// Measure the compaction time without interrupting it.
-	var timeCompactionUninterrupted time.Duration
-	{
-		db, err := open(tmpdir, promslog.NewNopLogger(), nil, DefaultOptions(), []int64{1, 2000}, nil)
+	_, err = compactor.CompactWithBlockPopulator(tmpdir, blockDirs, nil, blockPopulatorFunc(
+		func(context.Context, *CompactorMetrics, *slog.Logger, chunkenc.Pool, storage.VerticalChunkSeriesMergeFunc, LeveledCompactorConcurrencyOptions, []BlockReader, int64, int64, []shardedBlock, IndexReaderPostingsFunc) error {
+			return context.Canceled
+		},
+	), 1)
+	require.ErrorIs(t, err, context.Canceled)
+
+	for _, dir := range blockDirs {
+		meta, _, err := readMetaFile(dir)
 		require.NoError(t, err)
-		require.Len(t, db.Blocks(), 3, "initial block count mismatch")
-		require.Equal(t, 0.0, prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.Ran), "initial compaction counter mismatch")
-		db.compactc <- struct{}{} // Trigger a compaction.
-		for prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.PopulatingBlocks) <= 0 {
-			time.Sleep(3 * time.Millisecond)
-		}
-
-		start := time.Now()
-		for prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.Ran) != 1 {
-			time.Sleep(3 * time.Millisecond)
-		}
-		timeCompactionUninterrupted = time.Since(start)
-
-		require.NoError(t, db.Close())
-	}
-	// Measure the compaction time when closing the db in the middle of compaction.
-	{
-		db, err := open(tmpdirCopy, promslog.NewNopLogger(), nil, DefaultOptions(), []int64{1, 2000}, nil)
-		require.NoError(t, err)
-		require.Len(t, db.Blocks(), 3, "initial block count mismatch")
-		require.Equal(t, 0.0, prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.Ran), "initial compaction counter mismatch")
-		db.compactc <- struct{}{} // Trigger a compaction.
-
-		for prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.PopulatingBlocks) <= 0 {
-			time.Sleep(3 * time.Millisecond)
-		}
-
-		start := time.Now()
-		require.NoError(t, db.Close())
-		actT := time.Since(start)
-
-		expT := timeCompactionUninterrupted / 2 // Closing the db in the middle of compaction should less than half the time.
-		require.Less(t, actT, expT, "closing the db took more than expected. exp: <%v, act: %v", expT, actT)
-
-		// Make sure that no blocks were marked as compaction failed.
-		// This checks that the `context.Canceled` error is properly checked at all levels:
-		// - callers should check with errors.Is() instead of ==.
-		readOnlyDB, err := OpenDBReadOnly(tmpdirCopy, "", promslog.NewNopLogger())
-		require.NoError(t, err)
-		blocks, err := readOnlyDB.Blocks()
-		require.NoError(t, err)
-		for i, b := range blocks {
-			require.Falsef(t, b.Meta().Compaction.Failed, "block %d (%s) should not be marked as compaction failed", i, b.Meta().ULID)
-		}
-		require.NoError(t, readOnlyDB.Close())
+		require.Falsef(t, meta.Compaction.Failed, "block %s should not be marked as compaction failed", meta.ULID)
 	}
 }
 
@@ -1504,6 +2043,124 @@ func TestDeleteCompactionBlockAfterFailedReload(t *testing.T) {
 			require.Equal(t, expBlocks, len(actBlocks)-1, "block count should be the same as before the compaction") // -1 to exclude the corrupted block.
 		})
 	}
+}
+
+func TestOpenBlocksForCompaction(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	const blocks = 5
+
+	var blockDirs []string
+	for range blocks {
+		d := createBlock(t, dir, genSeries(100, 10, 0, 5000))
+		blockDirs = append(blockDirs, d)
+	}
+
+	// Open subset of blocks first.
+	const blocksToOpen = 2
+	opened, toClose, err := openBlocksForCompaction(ctx, blockDirs[:blocksToOpen], nil, promslog.NewNopLogger(), nil, nil, 10)
+	for _, b := range toClose {
+		defer func(b *Block) { require.NoError(t, b.Close()) }(b)
+	}
+
+	require.NoError(t, err)
+	checkBlocks(t, opened, blockDirs[:blocksToOpen]...)
+	checkBlocks(t, toClose, blockDirs[:blocksToOpen]...)
+
+	// Open all blocks, but provide previously opened blocks.
+	opened2, toClose2, err := openBlocksForCompaction(ctx, blockDirs, opened, promslog.NewNopLogger(), nil, nil, 10)
+	for _, b := range toClose2 {
+		defer func(b *Block) { require.NoError(t, b.Close()) }(b)
+	}
+
+	require.NoError(t, err)
+	checkBlocks(t, opened2, blockDirs...)
+	checkBlocks(t, toClose2, blockDirs[blocksToOpen:]...)
+}
+
+func TestOpenBlocksForCompactionErrorsNoMeta(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	const blocks = 5
+
+	var blockDirs []string
+	for ix := range blocks {
+		d := createBlock(t, dir, genSeries(100, 10, 0, 5000))
+		blockDirs = append(blockDirs, d)
+
+		if ix == 3 {
+			blockDirs = append(blockDirs, path.Join(dir, "invalid-block"))
+		}
+	}
+
+	// open block[0]
+	b0, err := OpenBlock(promslog.NewNopLogger(), blockDirs[0], nil, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, b0.Close()) }()
+
+	_, toClose, err := openBlocksForCompaction(ctx, blockDirs, []*Block{b0}, promslog.NewNopLogger(), nil, nil, 10)
+
+	require.Error(t, err)
+	// We didn't get to opening more blocks, because we found invalid dir, so there is nothing to close.
+	require.Empty(t, toClose)
+}
+
+func TestOpenBlocksForCompactionErrorsMissingIndex(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	const blocks = 5
+
+	var blockDirs []string
+	for ix := range blocks {
+		d := createBlock(t, dir, genSeries(100, 10, 0, 5000))
+		blockDirs = append(blockDirs, d)
+
+		if ix == 3 {
+			require.NoError(t, os.Remove(path.Join(d, indexFilename)))
+		}
+	}
+
+	// open block[1]
+	b1, err := OpenBlock(promslog.NewNopLogger(), blockDirs[1], nil, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, b1.Close()) }()
+
+	// We use concurrency = 1 to simplify the test.
+	// Block[0] will be opened correctly.
+	// Block[1] is already opened.
+	// Block[2] will be opened correctly.
+	// Block[3] is invalid and will cause error.
+	// Block[4] will not be opened at all.
+	opened, toClose, err := openBlocksForCompaction(ctx, blockDirs, []*Block{b1}, promslog.NewNopLogger(), nil, nil, 1)
+	for _, b := range toClose {
+		defer func(b *Block) { require.NoError(t, b.Close()) }(b)
+	}
+
+	require.Error(t, err)
+	checkBlocks(t, opened, blockDirs[0:3]...)
+	checkBlocks(t, toClose, blockDirs[0], blockDirs[2])
+}
+
+// Check that blocks match IDs from directories.
+func checkBlocks(t *testing.T, blocks []*Block, dirs ...string) {
+	t.Helper()
+
+	blockIDs := map[string]struct{}{}
+	for _, b := range blocks {
+		blockIDs[b.Meta().ULID.String()] = struct{}{}
+	}
+
+	dirBlockIDs := map[string]struct{}{}
+	for _, d := range dirs {
+		m, _, err := readMetaFile(d)
+		require.NoError(t, err)
+		dirBlockIDs[m.ULID.String()] = struct{}{}
+	}
+
+	require.Equal(t, blockIDs, dirBlockIDs)
 }
 
 func TestHeadCompactionWithHistograms(t *testing.T) {
@@ -1825,7 +2482,8 @@ func TestSparseHistogramSpaceSavings(t *testing.T) {
 					numSpans:               c.numSpans,
 					gapBetweenSpans:        c.gapBetweenSpans,
 				})
-			})
+			},
+		)
 	}
 
 	for _, s := range summaries {
@@ -1956,6 +2614,403 @@ func TestCompactBlockMetas(t *testing.T) {
 		},
 	}
 	require.Equal(t, expected, output)
+}
+
+// TestCompactBlockMetasHints verifies that CompactBlockMetas propagates the
+// compaction hints to the merged block: the from-stale-series hint is kept when
+// any source carries it (the planner only ever groups stale with stale), and the
+// from-out-of-order hint is kept only when every source carries it (out-of-order
+// blocks may be co-compacted with in-order blocks). Dropping either hint would
+// wrongly advance inOrderBlocksMaxTime. See #18379.
+func TestCompactBlockMetasHints(t *testing.T) {
+	parent1 := ulid.MustNew(100, nil)
+	parent2 := ulid.MustNew(200, nil)
+	outUlid := ulid.MustNew(1000, nil)
+
+	staleMeta := func(u ulid.ULID) *BlockMeta {
+		m := &BlockMeta{ULID: u, MinTime: 0, MaxTime: 1000, Compaction: BlockMetaCompaction{Level: 1}}
+		m.Compaction.SetStaleSeries()
+		return m
+	}
+	oooMeta := func(u ulid.ULID) *BlockMeta {
+		m := &BlockMeta{ULID: u, MinTime: 0, MaxTime: 1000, Compaction: BlockMetaCompaction{Level: 1}}
+		m.Compaction.SetOutOfOrder()
+		return m
+	}
+	plainMeta := func(u ulid.ULID) *BlockMeta {
+		return &BlockMeta{ULID: u, MinTime: 0, MaxTime: 1000, Compaction: BlockMetaCompaction{Level: 1}}
+	}
+
+	// staleOOOMeta is a single source carrying BOTH the from-stale-series and the
+	// from-out-of-order hints at once.
+	staleOOOMeta := func(u ulid.ULID) *BlockMeta {
+		m := &BlockMeta{ULID: u, MinTime: 0, MaxTime: 1000, Compaction: BlockMetaCompaction{Level: 1}}
+		m.Compaction.SetStaleSeries()
+		m.Compaction.SetOutOfOrder()
+		return m
+	}
+
+	t.Run("single source carrying both hints keeps both", func(t *testing.T) {
+		// One source with both hints: stale survives by any-source semantics, and
+		// out-of-order survives because the single (only) source is out-of-order, so
+		// every source is out-of-order.
+		out := CompactBlockMetas(outUlid, staleOOOMeta(parent1))
+		require.True(t, out.Compaction.FromStaleSeries(), "merged block must keep the from-stale-series hint")
+		require.True(t, out.Compaction.FromOutOfOrder(), "merged block must keep the from-out-of-order hint when the only source is out-of-order")
+	})
+
+	t.Run("stale+ooo source with an ooo-only source keeps both", func(t *testing.T) {
+		// Stale survives by any-source semantics; out-of-order survives because
+		// every source (one stale+ooo, one ooo-only) is out-of-order.
+		out := CompactBlockMetas(outUlid, staleOOOMeta(parent1), oooMeta(parent2))
+		require.True(t, out.Compaction.FromStaleSeries(), "merged block must keep the from-stale-series hint when any source is stale")
+		require.True(t, out.Compaction.FromOutOfOrder(), "merged block must keep the from-out-of-order hint when every source is out-of-order")
+	})
+
+	t.Run("stale+ooo source with a plain source keeps stale and drops ooo", func(t *testing.T) {
+		// Stale survives by any-source semantics; out-of-order is dropped because the
+		// plain source is in-order, so not every source is out-of-order.
+		out := CompactBlockMetas(outUlid, staleOOOMeta(parent1), plainMeta(parent2))
+		require.True(t, out.Compaction.FromStaleSeries(), "merged block must keep the from-stale-series hint when any source is stale")
+		require.False(t, out.Compaction.FromOutOfOrder(), "merged block must drop the from-out-of-order hint when a source is in-order")
+	})
+
+	t.Run("stale hint is preserved when a source is stale", func(t *testing.T) {
+		out := CompactBlockMetas(outUlid, staleMeta(parent1), staleMeta(parent2))
+		require.True(t, out.Compaction.FromStaleSeries(), "merged block must keep the from-stale-series hint")
+		require.False(t, out.Compaction.FromOutOfOrder())
+	})
+
+	t.Run("out-of-order hint is preserved when all sources are out-of-order", func(t *testing.T) {
+		out := CompactBlockMetas(outUlid, oooMeta(parent1), oooMeta(parent2))
+		require.True(t, out.Compaction.FromOutOfOrder(), "merged block must keep the from-out-of-order hint when all sources are out-of-order")
+		require.False(t, out.Compaction.FromStaleSeries())
+	})
+
+	t.Run("out-of-order hint is dropped when mixed with in-order", func(t *testing.T) {
+		out := CompactBlockMetas(outUlid, oooMeta(parent1), plainMeta(parent2))
+		require.False(t, out.Compaction.FromOutOfOrder(), "merged block must drop the from-out-of-order hint when it also contains in-order data")
+	})
+
+	t.Run("stale kept and out-of-order dropped when sources mix stale and out-of-order", func(t *testing.T) {
+		// Stale uses any-source semantics, so the stale hint survives; out-of-order
+		// uses all-sources semantics, so a mix of stale and out-of-order is not all
+		// out-of-order and the out-of-order hint is dropped.
+		out := CompactBlockMetas(outUlid, staleMeta(parent1), oooMeta(parent2))
+		require.True(t, out.Compaction.FromStaleSeries(), "merged block must keep the from-stale-series hint when any source is stale")
+		require.False(t, out.Compaction.FromOutOfOrder(), "merged block must drop the from-out-of-order hint when not every source is out-of-order")
+	})
+
+	t.Run("no hint when no source carries one", func(t *testing.T) {
+		out := CompactBlockMetas(outUlid, plainMeta(parent1), plainMeta(parent2))
+		require.False(t, out.Compaction.FromStaleSeries())
+		require.False(t, out.Compaction.FromOutOfOrder())
+	})
+}
+
+func TestLeveledCompactor_plan_overlapping_disabled(t *testing.T) {
+	// This mimics our default ExponentialBlockRanges with min block size equals to 20.
+	compactor, err := NewLeveledCompactorWithOptions(context.Background(), nil, nil, []int64{
+		20,
+		60,
+		180,
+		540,
+		1620,
+	}, nil, LeveledCompactorOptions{
+		EnableOverlappingCompaction: false,
+	})
+	require.NoError(t, err)
+
+	cases := map[string]struct {
+		metas    []dirMeta
+		expected []string
+	}{
+		"Outside Range": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+			},
+			expected: nil,
+		},
+		"We should wait for four blocks of size 20 to appear before compacting.": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+			},
+			expected: nil,
+		},
+		`We should wait for a next block of size 20 to appear before compacting
+		the existing ones. We have three, but we ignore the fresh one from WAl`: {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 40, 60, nil),
+			},
+			expected: nil,
+		},
+		"Block to fill the entire parent range appeared – should be compacted": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 40, 60, nil),
+				metaRange("4", 60, 80, nil),
+			},
+			expected: []string{"1", "2", "3"},
+		},
+		`Block for the next parent range appeared with gap with size 20. Nothing will happen in the first one
+		anymore but we ignore fresh one still, so no compaction`: {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 60, 80, nil),
+			},
+			expected: nil,
+		},
+		`Block for the next parent range appeared, and we have a gap with size 20 between second and third block.
+		We will not get this missed gap anymore and we should compact just these two.`: {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 60, 80, nil),
+				metaRange("4", 80, 100, nil),
+			},
+			expected: []string{"1", "2"},
+		},
+		"We have 20, 20, 20, 60, 60 range blocks. '5' is marked as fresh one": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 40, 60, nil),
+				metaRange("4", 60, 120, nil),
+				metaRange("5", 120, 180, nil),
+			},
+			expected: []string{"1", "2", "3"},
+		},
+		"We have 20, 60, 20, 60, 240 range blocks. We can compact 20 + 60 + 60": {
+			metas: []dirMeta{
+				metaRange("2", 20, 40, nil),
+				metaRange("4", 60, 120, nil),
+				metaRange("5", 960, 980, nil), // Fresh one.
+				metaRange("6", 120, 180, nil),
+				metaRange("7", 720, 960, nil),
+			},
+			expected: []string{"2", "4", "6"},
+		},
+		"Do not select large blocks that have many tombstones when there is no fresh block": {
+			metas: []dirMeta{
+				metaRange("1", 0, 540, &BlockStats{
+					NumSeries:     10,
+					NumTombstones: 3,
+				}),
+			},
+			expected: nil,
+		},
+		"Select large blocks that have many tombstones when fresh appears": {
+			metas: []dirMeta{
+				metaRange("1", 0, 540, &BlockStats{
+					NumSeries:     10,
+					NumTombstones: 3,
+				}),
+				metaRange("2", 540, 560, nil),
+			},
+			expected: []string{"1"},
+		},
+		"For small blocks, do not compact tombstones, even when fresh appears.": {
+			metas: []dirMeta{
+				metaRange("1", 0, 60, &BlockStats{
+					NumSeries:     10,
+					NumTombstones: 3,
+				}),
+				metaRange("2", 60, 80, nil),
+			},
+			expected: nil,
+		},
+		`Regression test: we were stuck in a compact loop where we always recompacted
+		the same block when tombstones and series counts were zero`: {
+			metas: []dirMeta{
+				metaRange("1", 0, 540, &BlockStats{
+					NumSeries:     0,
+					NumTombstones: 0,
+				}),
+				metaRange("2", 540, 560, nil),
+			},
+			expected: nil,
+		},
+		`Regression test: we were wrongly assuming that new block is fresh from WAL when its ULID is newest.
+		We need to actually look on max time instead.
+		With previous, wrong approach "8" block was ignored, so we were wrongly compacting 5 and 7 and introducing
+		block overlaps`: {
+			metas: []dirMeta{
+				metaRange("5", 0, 360, nil),
+				metaRange("6", 540, 560, nil), // Fresh one.
+				metaRange("7", 360, 420, nil),
+				metaRange("8", 420, 540, nil),
+			},
+			expected: []string{"7", "8"},
+		},
+		// |--------------|
+		//               |----------------|
+		//                                |--------------|
+		"Overlapping blocks 1": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 19, 40, nil),
+				metaRange("3", 40, 60, nil),
+			},
+			expected: nil,
+		},
+		// |--------------|
+		//                |--------------|
+		//                        |--------------|
+		"Overlapping blocks 2": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 20, 40, nil),
+				metaRange("3", 30, 50, nil),
+			},
+			expected: nil,
+		},
+		// |--------------|
+		//         |---------------------|
+		//                       |--------------|
+		"Overlapping blocks 3": {
+			metas: []dirMeta{
+				metaRange("1", 0, 20, nil),
+				metaRange("2", 10, 40, nil),
+				metaRange("3", 30, 50, nil),
+			},
+			expected: nil,
+		},
+		// |--------------|
+		//               |--------------------------------|
+		//                |--------------|
+		//                               |--------------|
+		"Overlapping blocks 4": {
+			metas: []dirMeta{
+				metaRange("5", 0, 360, nil),
+				metaRange("6", 340, 560, nil),
+				metaRange("7", 360, 420, nil),
+				metaRange("8", 420, 540, nil),
+			},
+			expected: nil,
+		},
+		// |--------------|
+		//               |--------------|
+		//                                            |--------------|
+		//                                                          |--------------|
+		"Overlapping blocks 5": {
+			metas: []dirMeta{
+				metaRange("1", 0, 10, nil),
+				metaRange("2", 9, 20, nil),
+				metaRange("3", 30, 40, nil),
+				metaRange("4", 39, 50, nil),
+			},
+			expected: nil,
+		},
+	}
+
+	for title, c := range cases {
+		if !t.Run(title, func(t *testing.T) {
+			res, err := compactor.plan(c.metas)
+			require.NoError(t, err)
+			require.Equal(t, c.expected, res)
+		}) {
+			return
+		}
+	}
+}
+
+func TestAsyncBlockWriterSuccess(t *testing.T) {
+	cw, err := chunks.NewWriter(t.TempDir())
+	require.NoError(t, err)
+
+	const series = 100
+	// prepare index, add all symbols
+	iw, err := index.NewWriter(context.Background(), filepath.Join(t.TempDir(), indexFilename))
+	require.NoError(t, err)
+
+	require.NoError(t, iw.AddSymbol("__name__"))
+	for ix := range series {
+		s := fmt.Sprintf("s_%3d", ix)
+		require.NoError(t, iw.AddSymbol(s))
+	}
+
+	// async block writer expects index writer ready to receive series.
+	abw := newAsyncBlockWriter(chunkenc.NewPool(), cw, iw, semaphore.NewWeighted(int64(1)))
+
+	for ix := range series {
+		s := fmt.Sprintf("s_%3d", ix)
+		require.NoError(t, abw.addSeries(labels.FromStrings("__name__", s), []chunks.Meta{{Chunk: randomChunk(t), MinTime: 0, MaxTime: math.MaxInt64}}))
+	}
+
+	// signal that no more series are coming
+	abw.closeAsync()
+
+	// We can do this repeatedly.
+	abw.closeAsync()
+	abw.closeAsync()
+
+	// wait for result
+	stats, err := abw.waitFinished()
+	require.NoError(t, err)
+	require.Equal(t, uint64(series), stats.NumSeries)
+	require.Equal(t, uint64(series), stats.NumChunks)
+
+	// We get the same result on subsequent calls to waitFinished.
+	for range 5 {
+		newstats, err := abw.waitFinished()
+		require.NoError(t, err)
+		require.Equal(t, stats, newstats)
+
+		// We can call close async again, as long as it's on the same goroutine.
+		abw.closeAsync()
+	}
+}
+
+func TestAsyncBlockWriterFailure(t *testing.T) {
+	cw, err := chunks.NewWriter(t.TempDir())
+	require.NoError(t, err)
+
+	// We don't write symbols to this index writer, so adding series next will fail.
+	iw, err := index.NewWriter(context.Background(), filepath.Join(t.TempDir(), indexFilename))
+	require.NoError(t, err)
+
+	// async block writer expects index writer ready to receive series.
+	abw := newAsyncBlockWriter(chunkenc.NewPool(), cw, iw, semaphore.NewWeighted(int64(1)))
+
+	// Adding single series doesn't fail, as it just puts it onto the queue.
+	require.NoError(t, abw.addSeries(labels.FromStrings("__name__", "test"), []chunks.Meta{{Chunk: randomChunk(t), MinTime: 0, MaxTime: math.MaxInt64}}))
+
+	// Signal that no more series are coming.
+	abw.closeAsync()
+
+	// We can do this repeatedly.
+	abw.closeAsync()
+	abw.closeAsync()
+
+	// Wait for result, this time we get error due to missing symbols.
+	_, err = abw.waitFinished()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "symbol entry for \"__name__\" does not exist")
+
+	// We get the same error on each repeated call to waitFinished.
+	for range 5 {
+		_, nerr := abw.waitFinished()
+		require.Equal(t, err, nerr)
+
+		// We can call close async again, as long as it's on the same goroutine.
+		abw.closeAsync()
+	}
+}
+
+func randomChunk(t *testing.T) chunkenc.Chunk {
+	chunk := chunkenc.NewXORChunk()
+	l := rand.Int() % 120
+	app, err := chunk.Appender()
+	require.NoError(t, err)
+	for range l {
+		app.Append(0, rand.Int63(), rand.Float64())
+	}
+	return chunk
 }
 
 func TestCompactEmptyResultBlockWithTombstone(t *testing.T) {

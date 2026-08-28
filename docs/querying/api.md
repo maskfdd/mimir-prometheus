@@ -101,8 +101,8 @@ URL query parameters:
 - `timeout=<duration>`: Evaluation timeout. Optional. Defaults to and
    is capped by the value of the `-query.timeout` flag.
 - `limit=<number>`: Maximum number of returned series. Doesn't affect scalars or strings but truncates the number of series for matrices and vectors. Optional. 0 means disabled.
-- `lookback_delta=<duration | float>`: Override the the [lookback period](#staleness) just for this query in `duration` format or float number of seconds. Optional.
-- `stats=<string>`: Include query statistics in the response. If set to `all`, includes detailed statistics. Optional.
+- `lookback_delta=<duration | float>`: Override the [lookback period](#staleness) just for this query in `duration` format or float number of seconds. Optional.
+- `stats=<string>`: Include query statistics in the response. Supported values are `true` (basic statistics) and `all` (additionally includes detailed per-step statistics: timings and sample counts). Any other non-empty value currently behaves like `true`, but is deprecated, adds a warning to the response, and will be rejected in the next major release. Optional. See [Query statistics](#query-statistics).
 
 The current server time is used if the `time` parameter is omitted.
 
@@ -175,8 +175,8 @@ URL query parameters:
 - `timeout=<duration>`: Evaluation timeout. Optional. Defaults to and
    is capped by the value of the `-query.timeout` flag.
 - `limit=<number>`: Maximum number of returned series. Optional. 0 means disabled.
-- `lookback_delta=<duration | float>`: Override the the [lookback period](#staleness) just for this query in `duration` format or float number of seconds. Optional.
-- `stats=<string>`: Include query statistics in the response. If set to `all`, includes detailed statistics. Optional.
+- `lookback_delta=<duration | float>`: Override the [lookback period](#staleness) just for this query in `duration` format or float number of seconds. Optional.
+- `stats=<string>`: Include query statistics in the response. Supported values are `true` (basic statistics) and `all` (additionally includes detailed per-step statistics: timings and sample counts). Any other non-empty value currently behaves like `true`, but is deprecated, adds a warning to the response, and will be rejected in the next major release. Optional. See [Query statistics](#query-statistics).
 
 You can URL-encode these parameters directly in the request body by using the `POST` method and
 `Content-Type: application/x-www-form-urlencoded` header. This is useful when specifying a large
@@ -235,6 +235,20 @@ curl 'http://localhost:9090/api/v1/query_range?query=up&start=2015-07-01T20:10:3
    }
 }
 ```
+
+### Query statistics
+
+When the `stats` parameter is set (e.g. `stats=all`), the response `data` includes a `stats` object with the following structure:
+
+- **timings**: Durations (in seconds) for different phases of query execution (e.g. `evalTotalTime`, `execQueueTime`).
+- **samples**:
+  - **totalQueryableSamples**: Total number of samples *loaded* during the query. For range-vector functions over multiple steps, each step counts the full window.
+  - **totalQueryableSamplesPerStep**: (Only with `stats=all` and when per-step stats are enabled.) Per-step count of samples loaded; same semantics as `totalQueryableSamples` per step.
+  - **samplesRead**: Total number of samples *read* (I/O). For range-vector functions in range queries, only new points per step are counted; for other queries this equals `totalQueryableSamples`.
+  - **samplesReadPerStep**: (Only with `stats=all` and when per-step stats are enabled.) Per-step count of samples read (delta semantics for range-vector).
+  - **peakSamples**: Peak number of samples in memory during evaluation.
+
+The server also exposes two Prometheus metrics: `prometheus_engine_query_samples_total` (samples loaded) and `prometheus_engine_query_samples_read_total` (samples read). See [Per-step stats](../feature_flags.md#per-step-stats) for the `promql-per-step-stats` feature flag.
 
 ## Formatting query expressions
 
@@ -521,6 +535,114 @@ curl http://localhost:9090/api/v1/label/U__http_2e_status_code/values
 }
 ```
 
+### Searching metric names, label names, and label values
+
+These endpoints are experimental and must be enabled with
+`--enable-feature=search-api`.
+
+The following endpoints provide streamed discovery results for metric names,
+label names, and label values:
+
+```
+GET /api/v1/search/metric_names
+POST /api/v1/search/metric_names
+GET /api/v1/search/label_names
+POST /api/v1/search/label_names
+GET /api/v1/search/label_values
+POST /api/v1/search/label_values
+```
+
+These endpoints return newline-delimited JSON with content type
+`application/x-ndjson`. The stream contract is:
+
+- Zero or more **batch lines**, each with a `results` array and an optional
+  `warnings` array.
+- The stream then ends with **either** a **trailer line** (`status`, `has_more`,
+  optional `warnings`) **or** an **error line** (`status`, `errorType`, `error`)
+  if iteration failed mid-stream after the first batch was sent.
+
+```json
+{"results":[{"name":"http_requests_total","type":"counter","help":"Total HTTP requests."}]}
+{"status":"success","has_more":false}
+```
+
+If an error occurs **before** streaming starts, the API returns the usual
+Prometheus JSON error object with a 4xx/5xx status code. If an error occurs
+**after** streaming starts, the stream ends with an NDJSON error line in place
+of the trailer.
+
+Clients must tolerate an abrupt EOF without a trailer (for example, on
+transport failure or server shutdown) and must ignore unknown fields in the
+trailer for forward compatibility.
+
+The `has_more` field in the trailer is informational only: this version of
+the API does not provide a pagination cursor. To retrieve more results, raise
+`limit` (subject to the operator-configured `--web.search.max-limit`) or narrow
+the request via `match[]`. A future version of the API may add a cursor.
+
+Common URL query parameters:
+
+- `match[]=<series_selector>`: Repeated series selector used to scope the
+  search. Optional.
+- `search[]=<string>`: Repeated search string matched against names or values.
+  Multiple values use OR semantics. Optional.
+- `fuzz_threshold=<number>`: Fuzzy threshold from 0 to 100. Optional. A value
+  of 0 is the lowest fuzzy threshold.
+- `fuzz_alg=<subsequence | jarowinkler>`: Matching algorithm. Optional. Default
+  is `subsequence`.
+- `case_sensitive=<bool>`: Toggle case-sensitive matching. Optional.
+- `sort_by=<string>`: Sort mode. Supported values depend on the endpoint.
+- `sort_dir=<asc | dsc>`: Sort direction. Optional. Only valid with
+  `sort_by=alpha`.
+- `include_score=<bool>`: Include the relevance score in each result. Optional.
+- `start=<rfc3339 | unix_timestamp>`: Start timestamp. Optional.
+- `end=<rfc3339 | unix_timestamp>`: End timestamp. Optional.
+- `limit=<number>`: Maximum number of returned results. Optional. Default is
+  100.
+- `batch_size=<number>`: Preferred number of results per NDJSON batch.
+  Optional. Default is 100.
+
+The `start` and `end` parameters narrow results to the selected time window.
+Results may include values from series active slightly outside that window,
+because Prometheus stores data in fixed-size blocks (typically 2 hours each).
+
+Additional parameters for `/api/v1/search/metric_names`:
+
+- `include_metadata=<bool>`: Include metric metadata in each result.
+- `sort_by=<alpha | score>`
+
+Additional parameters for `/api/v1/search/label_names`:
+
+- `sort_by=<alpha | score>`
+
+Additional parameters for `/api/v1/search/label_values`:
+
+- `label=<label_name>`: Label name whose values should be searched. Required.
+- `sort_by=<alpha | score>`
+
+This example searches metric names for autocomplete:
+
+```bash
+curl -g 'http://localhost:9090/api/v1/search/metric_names?search[]=http_req&sort_by=score&include_metadata=true&limit=5'
+```
+
+```json
+{"results":[{"name":"http_requests_total","type":"counter","help":"Total HTTP requests."}]}
+{"status":"success","has_more":false}
+```
+
+This example searches label values for the `instance` label within the `up`
+metric:
+
+```bash
+curl -g 'http://localhost:9090/api/v1/search/label_values?label=instance&match[]=up&search[]=909&sort_by=score'
+```
+
+```json
+{"results":[{"value":"localhost:9090"},{"value":"localhost:9091"}]}
+{"status":"success","has_more":true}
+```
+
 ## Querying exemplars
 
 This is **experimental** and might change in the future.
@@ -717,6 +839,36 @@ curl http://localhost:9090/api/v1/scrape_pools
 
 *New in v2.42*
 
+### Scrape pool configuration
+
+This endpoint is **experimental** and might change in the future. It is
+currently intended for use by Prometheus' own web UI.
+
+The following endpoint returns the effective configuration for a scrape pool.
+This includes scrape configurations loaded through `scrape_config_files`.
+Authentication credentials and other secrets are redacted.
+
+The `scrapePool` query parameter is required and must contain the name of a
+configured scrape pool.
+
+```
+GET /api/v1/scrape_pools/config?scrapePool=<scrape_pool_name>
+```
+
+```bash
+curl -G http://localhost:9090/api/v1/scrape_pools/config \
+  --data-urlencode 'scrapePool=prometheus'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "yaml": "job_name: prometheus\nscrape_interval: 15s\nscrape_timeout: 10s\nmetrics_path: /metrics\nscheme: http\n"
+  }
+}
+```
+
 ## Targets
 
 The following endpoint returns an overview of the current state of the
@@ -766,9 +918,12 @@ curl http://localhost:9090/api/v1/targets
       {
         "discoveredLabels": {
           "__address__": "127.0.0.1:9100",
+          "__always_scrape_classic_histograms__": "false",
+          "__convert_classic_histograms_to_nhcb__": "false",
           "__metrics_path__": "/metrics",
           "__scheme__": "http",
           "__scrape_interval__": "1m",
+          "__scrape_native_histograms__": "false",
           "__scrape_timeout__": "10s",
           "job": "node"
         },
@@ -1713,6 +1868,14 @@ Enable the remote write receiver by setting
 endpoint is `/api/v1/write`. Find more details [here](../storage.md#overview).
 
 *New in v2.33*
+
+## Remote Read
+
+`POST /api/v1/read`
+
+Prometheus exposes a remote read endpoint that allows external systems (such as Thanos) to read data from the TSDB.
+
+For more details, see the [Remote Read API documentation](https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/) and the guide on [Remote Endpoints and Storage](https://prometheus.io/docs/operating/integrations/#remote-endpoints-and-storage).
 
 ## OTLP Receiver
 

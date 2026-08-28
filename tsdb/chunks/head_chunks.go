@@ -15,6 +15,7 @@ package chunks
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -274,7 +275,14 @@ func NewChunkDiskMapper(reg prometheus.Registerer, dir string, pool chunkenc.Poo
 		m.pool = chunkenc.NewPool()
 	}
 
-	return m, m.openMMapFiles()
+	if err := m.openMMapFiles(); err != nil {
+		if m.writeQueue != nil {
+			m.writeQueue.stop()
+		}
+		err = errors.Join(err, m.dir.Close())
+		return nil, err
+	}
+	return m, nil
 }
 
 // Chunk encodings for out-of-order chunks.
@@ -565,11 +573,12 @@ func (cdm *ChunkDiskMapper) writeChunk(seriesRef HeadSeriesRef, mint, maxt int64
 }
 
 // CutNewFile makes that a new file will be created the next time a chunk is written.
-func (cdm *ChunkDiskMapper) CutNewFile() {
+func (cdm *ChunkDiskMapper) CutNewFile() error {
 	cdm.evtlPosMtx.Lock()
 	defer cdm.evtlPosMtx.Unlock()
 
 	cdm.evtlPos.cutFileOnNextChunk()
+	return nil
 }
 
 func (cdm *ChunkDiskMapper) IsQueueEmpty() bool {
@@ -811,10 +820,7 @@ func (cdm *ChunkDiskMapper) Chunk(ref ChunkDiskMapperRef) (chunkenc.Chunk, error
 	// Make a copy of the chunk data to prevent a panic occurring because the returned
 	// chunk data slice references an mmap-ed file which could be closed after the
 	// function returns but while the chunk is still in use.
-	chkDataCopy := make([]byte, len(chkData))
-	copy(chkDataCopy, chkData)
-
-	chk, err := cdm.pool.Get(chunkenc.Encoding(chkEnc), chkDataCopy)
+	chk, err := cdm.pool.Get(chunkenc.Encoding(chkEnc), bytes.Clone(chkData))
 	if err != nil {
 		return nil, &CorruptionErr{
 			Dir:       cdm.dir.Name(),
@@ -925,8 +931,7 @@ func (cdm *ChunkDiskMapper) IterateAllChunks(f func(seriesRef HeadSeriesRef, chu
 			// Extract the encoding from the byte. ChunkDiskMapper uses only the last 7 bits for the encoding.
 			chkEnc = cdm.RemoveMasks(chkEnc)
 			if err := f(seriesRef, chunkRef, mint, maxt, numSamples, chkEnc, isOOO); err != nil {
-				var cerr *CorruptionErr
-				if errors.As(err, &cerr) {
+				if cerr, ok := errors.AsType[*CorruptionErr](err); ok {
 					cerr.Dir = cdm.dir.Name()
 					cerr.FileIndex = segID
 					return cerr
@@ -975,7 +980,7 @@ func (cdm *ChunkDiskMapper) Truncate(fileNo uint32) error {
 		// There is a known race condition here because between the check of curFileSize() and the call to CutNewFile()
 		// a new file could already be cut, this is acceptable because it will simply result in an empty file which
 		// won't do any harm.
-		cdm.CutNewFile()
+		errs = append(errs, cdm.CutNewFile())
 	}
 	pendingDeletes, err := cdm.deleteFiles(removedFiles)
 	errs = append(errs, err)

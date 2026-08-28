@@ -41,6 +41,34 @@ import (
 	"github.com/prometheus/prometheus/tsdb/wlog"
 )
 
+// TestBlockMetaCompaction_SetSelectedSeries verifies the round-trip behaviour of the
+// FromSelectedSeries compaction hint: it is initially absent, becomes present after
+// SetSelectedSeries, repeated calls are idempotent, and it is independent of the
+// FromStaleSeries hint (the two can co-exist on the same block meta if needed).
+func TestBlockMetaCompaction_SetSelectedSeries(t *testing.T) {
+	var bmc BlockMetaCompaction
+
+	// Initially absent.
+	require.False(t, bmc.FromSelectedSeries())
+
+	// Set it once.
+	bmc.SetSelectedSeries()
+	require.True(t, bmc.FromSelectedSeries())
+	require.Len(t, bmc.Hints, 1)
+
+	// Idempotent: setting again does not duplicate the hint.
+	bmc.SetSelectedSeries()
+	require.True(t, bmc.FromSelectedSeries())
+	require.Len(t, bmc.Hints, 1)
+
+	// Independent of FromStaleSeries.
+	require.False(t, bmc.FromStaleSeries())
+	bmc.SetStaleSeries()
+	require.True(t, bmc.FromStaleSeries())
+	require.True(t, bmc.FromSelectedSeries())
+	require.Len(t, bmc.Hints, 2)
+}
+
 // In Prometheus 2.1.0 we had a bug where the meta.json version was falsely bumped
 // to 2. We had a migration in place resetting it to 1 but we should move immediately to
 // version 3 next time to avoid confusion and issues.
@@ -166,7 +194,7 @@ func TestCorruptedChunk(t *testing.T) {
 				// Seek to the last byte of chunk data and modify it.
 				_, err = f.Seek(int64(chkEndOffset-1), 0)
 				require.NoError(t, err)
-				n, err := f.Write([]byte("x"))
+				n, err := f.WriteString("x")
 				require.NoError(t, err)
 				require.Equal(t, 1, n)
 			},
@@ -238,6 +266,10 @@ func TestLabelValuesWithMatchers(t *testing.T) {
 			"unique", fmt.Sprintf("value%d", i),
 		), []chunks.Sample{sample{0, 100, 0, nil, nil}}))
 	}
+	// Add another series with an overlapping unique label, but leaving out the tens label
+	seriesEntries = append(seriesEntries, storage.NewListSeries(labels.FromStrings(
+		"unique", "value99",
+	), []chunks.Sample{sample{0, 100, 0, nil, nil}}))
 
 	blockDir := createBlock(t, tmpdir, seriesEntries)
 	files, err := sequenceFiles(chunkDir(blockDir))
@@ -294,6 +326,15 @@ func TestLabelValuesWithMatchers(t *testing.T) {
 				labels.MustNewMatcher(labels.MatchNotEqual, "tens", ""),
 			},
 			expectedValues: uniqueWithout30s,
+		}, {
+			// In this case, we query for the "unique" label where the "tens" label is absent.
+			// We have one series where "tens" is empty (unique="value99"), but also another with
+			// the same value for "unique" and "tens" present. Make sure that unique="value99" is
+			// still found.
+			name:           "get unique ID where tens is empty",
+			labelName:      "unique",
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "tens", "")},
+			expectedValues: []string{"value99"},
 		},
 	}
 
@@ -410,6 +451,9 @@ func TestReadIndexFormatV1(t *testing.T) {
 	blockDir := filepath.Join("testdata", "index_format_v1")
 	block, err := OpenBlock(nil, blockDir, nil, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, block.Close())
+	})
 
 	q, err := NewBlockQuerier(block, 0, 1000)
 	require.NoError(t, err)
